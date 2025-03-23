@@ -96,13 +96,10 @@ elif data_str == 'cifar':
 elif data_str == 'celeb':
     from transportmodules.transportsCeleb import *
     data_dir = '../data/CelebA/img_align_celeba'
-
     zdim = 100
-    scale = 1.0
-
+    scale = 0.3
     img_size = 64
     xshape = (3,img_size,img_size)
-    
     # Transformations to be applied to each individual image sample
     transform=transforms.Compose([ transforms.Resize(img_size), transforms.CenterCrop(img_size), transforms.ToTensor(), transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
     # Load the dataset from file and apply transformations
@@ -113,11 +110,12 @@ elif data_str == 'celebahq':
     from transportmodules.transportsCelebHQ import *
     data_dir = '../data/celebahq/celeba_hq_256'
     zdim = 100
+    scale = 0.1
     img_size = 256
-    scale = 1.0
     xshape = (3,img_size,img_size)
     # Transformations to be applied to each individual image sample
     transform=transforms.Compose([ transforms.Resize(img_size), transforms.CenterCrop(img_size), transforms.ToTensor(), transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+    # Load the dataset from file and apply transformations
     dataset_nn = CustomCelebAHQ(data_dir,transform=transform,)
     PARAM = Parameters(batch_size=50, sample_size=1000, plot_freq=100)
 else:
