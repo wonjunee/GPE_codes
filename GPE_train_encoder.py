@@ -1,6 +1,9 @@
 #!/usr/bin/python
-""" 
-    Running simple sinkhorn algorithm.
+"""
+This script trains the GPE encoder using the specified dataset.
+Supported datasets include: MNIST, CIFAR-10, CelebA, and CelebA-HQ.
+
+To use a different dataset, modify the data loader section accordingly.
 """
 
 import argparse
@@ -15,10 +18,6 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from torchvision import datasets
 
-import copy
-
-# import zuko.utils as zukoutils
-# from torchdyn.core import NeuralODE
 from utils.functions import *
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7,8,9" 
@@ -26,21 +25,14 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7,8,9"
 parser = argparse.ArgumentParser()
 
 # general arguments
-parser.add_argument('--num_epochs', type=int, default=10000)
+parser.add_argument('--num_iter', type=int, default=1_000_000)
 # arguments to choose dataset (mnist, cifar, cifar-gray etc.)
 parser.add_argument('--cuda', action='store_true')
 parser.add_argument('--plot_every', type=int, default=1)
 parser.add_argument('--batch_size', type=int, default=100)
-parser.add_argument('--starting_epoch', type=int, default=0)
 parser.add_argument('--saving', type=str, default="0")
 parser.add_argument('--fig', type=str, default="0")
 parser.add_argument('--data', type=str, default="celeb")
-parser.add_argument('--grad_clip', type=float, default=1.0)
-parser.add_argument('--tqdm', type=int, default=0)
-
-# Training T or phi
-parser.add_argument('--load_T',    type=int, default=0)
-parser.add_argument('--save_T',    type=int, default=0)
 
 args = parser.parse_args()
 print(args)
@@ -176,27 +168,19 @@ optT = torch.optim.Adam(T.parameters(), lr=1e-4, betas=(b1, b2))
 # %%
 dataloader_valid = torch.utils.data.DataLoader(dataset_nn, batch_size=PARAM.sample_size, num_workers=num_workers, pin_memory=pin_memory, shuffle=True, drop_last=True)
 
-figure_count_T = 0
-elapsed_time_T = 0
-pbar = tqdm.tqdm(range(1_000_000))
-figure_count = 0
-start_time_T = time.time()
-loss_arr_T = []
+pbar = tqdm.tqdm(range(args.num_iter))
+
 for total_iterations in pbar:    
     imgs, _ = next(iter(dataloader))
     x = imgs.to(device).detach()
     optT.zero_grad()
-    loss = compute_GME_cost(T,x)
+    loss = compute_GME_cost(T, x)
     loss.backward()
     optT.step()
-
     pbar.set_description(f'GME loss: {loss.item():9.2e}')
-
-    # save the model and plot every 1000 iterations
-    if total_iterations%1000==0:
-        elapsed_time_T += time.time() - start_time_T
-        figure_count += 1
-        if args.save_T == 1:
-            torch.save(T.state_dict(), f"{save_data_path}/T.pt")
-        plot_and_save(T, x_val, total_iterations, figure_count, elapsed_time_T, save_data_path, save_fig_path, loss_arr_T)
-        start_time_T = time.time()
+    
+    # Save the module T every 1000 iterations
+    if total_iterations % 1000 == 0:
+        save_path = f'{save_data_path}/T.pth'
+        torch.save(T.state_dict(), save_path)
+        print(f'Model saved at iteration {total_iterations} to {save_path}')
