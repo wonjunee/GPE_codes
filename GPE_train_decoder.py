@@ -163,6 +163,6 @@ for total_iterations in pbar:
 
     # Save the module T every 1000 iterations
     if total_iterations % 1000 == 0:
-        save_path = f'{save_data_path}/S.pth'
-        torch.save(T.state_dict(), save_path)
+        save_path = f'{save_data_path}/S.pt'
+        torch.save(S.state_dict(), save_path)
         print(f'Model saved at iteration {total_iterations} to {save_path}')
