@@ -1,4 +1,7 @@
-# GPE Codes
+# Codes for Geometry-Preserving Encoder/Decoder In Latent Generative Models
+## by Wonjun Lee*, Riley C.W. O'Neill*, Dongmian Zou**, Jeff Calder*, Gilad Lerman*
+
+### * University of Minnesota, ** Duke Kunshan University
 
 ## Description
 
