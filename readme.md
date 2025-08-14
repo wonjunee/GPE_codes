@@ -1,7 +1,14 @@
-# Codes for Geometry-Preserving Encoder/Decoder In Latent Generative Models
-## by Wonjun Lee*, Riley C.W. O'Neill*, Dongmian Zou**, Jeff Calder*, Gilad Lerman*
+# Geometry-Preserving Encoder/Decoder in Latent Generative Models
 
-### * University of Minnesota, ** Duke Kunshan University
+**Authors:**  
+- Wonjun Lee\*  
+- Riley C. W. O'Neill\*  
+- Dongmian Zou\*\*  
+- Jeff Calder\*  
+- Gilad Lerman\*
+
+\* University of Minnesota  
+\*\* Duke Kunshan University
 
 ## Description
 
