@@ -127,8 +127,6 @@ class ToyDataset(torch.utils.data.Dataset):
             x = np.cos(2.0*np.pi*i/n_mode)
             y = np.sin(2.0*np.pi*i/n_mode)
             point = np.random.randn(dim) * 0.5
-            # point[0] = x * scale * (0.6 + np.random.normal()*0.3)
-            # point[1] = y * scale * (0.6 + np.random.normal()*0.3)
 
             point[0] = x * 1.5
             point[1] = y * 1.5
@@ -139,8 +137,6 @@ class ToyDataset(torch.utils.data.Dataset):
             x = np.cos(2.0*np.pi*(i+0.5)/n_mode2)
             y = np.sin(2.0*np.pi*(i+0.5)/n_mode2)
             point = np.random.randn(dim) * 0.2
-            # point[0] = x * scale * (0.6 + np.random.normal()*0.3)
-            # point[1] = y * scale * (0.6 + np.random.normal()*0.3)
 
             point[0] = x * 3.0
             point[1] = y * 3.0
@@ -358,257 +354,40 @@ def odeint(odefun, z, t0, t1):
 
     return z        
 
+def cdist_squared(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # a: (n, d), b: (m, d)
+    # ||a - b||^2 = ||a||^2 + ||b||^2 - 2 a·b
+    a2 = (a * a).sum(dim=1, keepdim=True)          # (n, 1)
+    b2 = (b * b).sum(dim=1, keepdim=True).transpose(0, 1)  # (1, m)
+    d2 = a2 + b2 - 2.0 * (a @ b.transpose(0, 1))   # (n, m)
+    return d2.clamp_min(0.0)                       # numerical safety
 
-def compute_GME_cost(T, x, more=False):
-    Tx = T(x).view((x.shape[0],-1))
-    x  = x.view((x.shape[0],-1))
-    
-    Txy = ((Tx.view((Tx.shape[0],1,Tx.shape[1]))-Tx.view((1,Tx.shape[0],Tx.shape[1])))**2).sum(2)
-    xy  = (( x.view(( x.shape[0],1, x.shape[1]))- x.view((1, x.shape[0], x.shape[1])))**2).sum(2)
-    
-    ATxy = (1.0+Txy).log()
-    Axy  = (1.0+xy ).log()
-    loss = ((ATxy - Axy)**2).mean()
-    
-    if more == True:
-        xy  = xy.detach().cpu().numpy()
-        Txy = Txy.detach().cpu().numpy()
-        xy  = xy[np.triu_indices(x.shape[0],1)]
-        Txy = Txy[np.triu_indices(x.shape[0],1)]
-        return loss, xy**0.5, Txy**0.5
+def compute_GME_cost(T, x, more: bool = False):
+    # Flatten once
+    Tx = T(x).view(x.shape[0], -1)
+    x_flat = x.view(x.shape[0], -1)
+
+    # Pairwise squared distances (no sqrt)
+    Txy = cdist_squared(Tx, Tx)
+    xy  = cdist_squared(x_flat, x_flat)
+
+    # Log(1 + distance^2) as before
+    ATxy = (1.0 + Txy).log()
+    Axy  = (1.0 + xy ).log()
+
+    loss = ((ATxy - Axy) ** 2).mean()
+
+    if more:
+        # Grab upper-triangular (i < j) entries and convert to Euclidean distances for output
+        n = x_flat.shape[0]
+        iu = torch.triu_indices(n, n, offset=1, device=xy.device)
+        xy_u  = xy[iu[0], iu[1]].sqrt()
+        Txy_u = Txy[iu[0], iu[1]].sqrt()
+
+        return loss, xy_u.detach().cpu().numpy(), Txy_u.detach().cpu().numpy()
+
     return loss
 
-
-
-
-def iterate_FMOT(Tx,z,R,optR,phi,optphi,count_c=0, skip_c=5, grad_clip=1, rate=0.9, C_phi=100.0, phi_noise=1e-2):
-    """perform a single iteration for FMOT method
-
-    Args:
-        Tx (torch vector): embedded data samples on zdim
-        z (torch vector): random variable on zdim
-        R (torch module): flow map from z to Tx
-        optR (optim): optimizer for R
-        phi (torch module): dual varaible for the pushforward constraint
-        optphi (optim): optimizer for phi
-        count_c (int, optional): this will be used to perform minimax. Defaults to 0.
-    """
-    device = Tx.device
-    
-    optR.zero_grad()
-    loss_R_total = R.compute_velocity_cost(Tx,size=5) + R.compute_velocity_R_cost(z, size=5) * 0.5
-    loss_R_total.backward()
-    torch.nn.utils.clip_grad_norm_(R.parameters(), grad_clip)  # new
-    optR.step()
-
-    if count_c % skip_c == 0:
-        c = C_phi * rate**(count_c/skip_c)
-        # c = 30.0/(1+(count_c/skip_c)%300)+ 1e-3
-        # c = 20 * (1 + np.log(1+epoch)) ** (- count_c/skip_c)
-        
-        optR.zero_grad()
-        Rz, running_cost = R(z, running=True)
-        loss_Running    = running_cost.mean()
-        loss_constraint = (phi(Tx).detach()).mean() - phi(Rz).mean() 
-        loss_R_total = (loss_Running + loss_constraint)
-        loss_R_total.backward()
-        torch.nn.utils.clip_grad_norm_(R.parameters(), grad_clip)  # new
-        optR.step()
-    
-        Rz, _     = R(z, running=True)
-        
-        optphi.zero_grad()
-        phiRz = phi(Rz.detach())
-        phiTx = phi(Tx.detach())
-        loss_phi = phiRz.mean() - phiTx.mean()
-        phiRz2 = phiRz.pow(2).mean()
-        phiTx2 = phiTx.pow(2).mean()
-        
-        # Tx_noise = torch.randn(Tx.shape, device=device) * 2
-        Tx_noise = (Tx + torch.randn(Tx.shape, device=device) * phi_noise).detach()
-        Tx_noise = Tx_noise.requires_grad_(True)
-        phiTx = phi(Tx_noise)
-        grad_out  = torch.ones((Tx.shape[0],1), device=device, requires_grad=False)
-        grad      = autograd.grad( phiTx, Tx_noise, grad_out, create_graph=True, retain_graph=True, only_inputs=True )[0]
-        grad = grad.view(grad.shape[0], -1)
-        grad_norm = grad.pow(2).mean(1).pow(1).mean()
-        loss_phi += (grad_norm + 0.1 * phiTx2) * c
-        
-        Rz_noise = (Rz + torch.randn(Rz.shape, device=device) * phi_noise).detach()
-        Rz_noise = Rz_noise.requires_grad_(True)
-        phiRz  = phi(Rz_noise)
-        grad_out  = torch.ones((Rz.shape[0],1), device=device, requires_grad=False)
-        grad      = autograd.grad( phiRz, Rz_noise, grad_out, create_graph=True, retain_graph=True, only_inputs=True )[0]
-        grad = grad.view(grad.shape[0], -1)
-        grad_norm = grad.pow(2).mean(1).pow(1).mean()
-        loss_phi += (grad_norm + 0.1 * phiRz2) * c
-        
-        loss_phi.backward()
-        torch.nn.utils.clip_grad_norm_(phi.parameters(), grad_clip)  # new
-        optphi.step()
-        
-def laplacian(x,phi):
-    xy    = (( x.view(( x.shape[0],1, x.shape[1]))- x.view((1, x.shape[0], x.shape[1])))**2).mean(2)
-    phixy = ((phi.view((phi.shape[0],1,phi.shape[1]))-phi.view((1,phi.shape[0],phi.shape[1])))**2).mean(2)
-    Axy   = 1.0/(1.0+xy )
-    return (Axy * phixy).mean()
-    
-
-def iterate_FMOT_v2(Tx,z,R,optR,phi,phi_copy,optphi,count_c=0, skip_c=5, grad_clip=1, rate=0.9, C_phi=100.0, phi_noise=1e-2):
-    """perform a single iteration for FMOT method
-        phi is different from the v1
-        phi^{k+1} = phi^{k} + sigma * nabla(J(phi^k) + |nabla(phi^{k} - phi^{k-1}|^2))
-
-    Args:
-        Tx (torch vector): embedded data samples on zdim
-        z (torch vector): random variable on zdim
-        R (torch module): flow map from z to Tx
-        optR (optim): optimizer for R
-        phi (torch module): dual varaible for the pushforward constraint
-        optphi (optim): optimizer for phi
-        count_c (int, optional): this will be used to perform minimax. Defaults to 0.
-    """
-    
-    optR.zero_grad()
-    loss_R_total = R.compute_velocity_cost(Tx,size=5) + R.compute_velocity_R_cost(z, size=5) * 0.5
-    loss_R_total.backward()
-    torch.nn.utils.clip_grad_norm_(R.parameters(), grad_clip)  # new
-    optR.step()
-
-    if count_c % skip_c == 0:
-        c = 50
-        # c = 5.0
-        
-        optR.zero_grad()
-        Rz, running_cost = R(z, running=True)
-        loss_Running    = running_cost.mean()
-        loss_constraint = (phi(Tx).detach()).mean() - phi(Rz).mean() 
-        loss_R_total = (loss_Running + loss_constraint)
-        loss_R_total.backward()
-        torch.nn.utils.clip_grad_norm_(R.parameters(), grad_clip)  # new
-        optR.step()
-    
-        Rz, _     = R(z, running=True)
-        Rz = Rz.detach()
-            
-        optphi.zero_grad()
-        phiRz = phi(Rz.detach())
-        phiTx = phi(Tx.detach())
-        loss_phi = phiRz.mean() - phiTx.mean()
-        
-        # Tx_noise = torch.randn(Tx.shape, device=device) * 2
-        # Tx_noise = (Tx + torch.randn(Tx.shape, device=device) * phi_noise).detach()
-        # Tx_noise = Tx
-        # Tx_noise = Tx_noise.requires_grad_(True)
-        # phiTx = phi(Tx_noise) - phi_copy(Tx_noise)
-        # grad_out  = torch.ones((Tx.shape[0],1), device=device, requires_grad=False)
-        # grad      = autograd.grad( phiTx, Tx_noise, grad_out, create_graph=True, retain_graph=True, only_inputs=True )[0]
-        # grad = grad.view(grad.shape[0], -1)
-        # grad_norm = grad.pow(2).mean(1).pow(1).mean()
-        # # loss_phi += (grad_norm + 0.01 * phiTx.pow(2).mean()) * c
-        # loss_phi += (grad_norm) * c
-        
-        # Rz_noise = (Rz + torch.randn(Rz.shape, device=device) * phi_noise).detach()
-        # Rz_noise = Rz
-        # Rz_noise = Rz_noise.requires_grad_(True)
-        # phiRz  = phi(Rz_noise) - phi_copy(Rz_noise)
-        # grad_out  = torch.ones((Rz.shape[0],1), device=device, requires_grad=False)
-        # grad      = autograd.grad( phiRz, Rz_noise, grad_out, create_graph=True, retain_graph=True, only_inputs=True )[0]
-        # grad = grad.view(grad.shape[0], -1)
-        # grad_norm = grad.pow(2).mean(1).pow(1).mean()
-        # # loss_phi += (grad_norm + 0.01 * phiRz.pow(2).mean()) * c
-        # loss_phi += (grad_norm) * c
-        
-        # Tx_noise = Tx
-        # Tx_noise = Tx_noise.requires_grad_(True)
-        
-        # phiTx = phi(Tx_noise) - phi_copy(Tx_noise)
-        # grad_out  = torch.ones((Tx.shape[0],1), device=device, requires_grad=False)
-        # grad      = autograd.grad( phiTx, Tx_noise, grad_out, create_graph=True, retain_graph=True, only_inputs=True )[0]
-        # grad = grad.view(grad.shape[0], -1)
-        # grad_norm = grad.pow(2).mean(1).pow(1).mean()
-        # # loss_phi += (grad_norm + 0.01 * phiTx.pow(2).mean()) * c
-        # loss_phi += (grad_norm) * c
-        
-        Tx_Rz = torch.concat((Tx,Rz),0)
-        phiRz  = phi(Tx_Rz) - phi_copy(Tx_Rz)
-        loss_phi += laplacian(Tx_Rz, Tx_Rz) * c
-        
-        loss_phi.backward()
-        torch.nn.utils.clip_grad_norm_(phi.parameters(), grad_clip)  # new
-        optphi.step()
-        
-
-
-def iterate_FMOT2(Tx,z,R,R2,optR,optR2,phi,optphi,FM_cost, count_c=0, skip_c=5, grad_clip=1, rate=0.9, C_phi=10.0):
-    """perform a single iteration for FMOT method
-
-    Args:
-        Tx (torch vector): embedded data samples on zdim
-        z (torch vector): random variable on zdim
-        R (torch module): flow map from z to Tx
-        optR (optim): optimizer for R
-        phi (torch module): dual varaible for the pushforward constraint
-        optphi (optim): optimizer for phi
-        count_c (int, optional): this will be used to perform minimax. Defaults to 0.
-    """
-    device = Tx.device
-    
-    optR.zero_grad()
-    # loss = R.compute_velocity_cost(Tx,size=1)
-    t, xt, ut = FM_cost.sample_location_and_conditional_flow(z, Tx)
-    vt = R.net(xt, t)
-    loss = (vt - ut).pow(2).mean() + R.compute_velocity_R_cost2(z, R2, size=1) * 0.5
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(R.parameters(), grad_clip)  # new
-    optR.step()
-
-    if count_c % skip_c == 0:
-        c = C_phi * rate**(count_c/skip_c)
-        # c = 30.0/(1+epoch)+ 1e-3
-        # c = 20 * (1 + np.log(1+epoch)) ** (- count_c/skip_c)
-        
-        optR2.zero_grad()
-        Rz, running_cost = R2(z, running=True)
-        loss_Running    = running_cost.mean() + R2.compute_velocity_cost(Tx,size=1,t=1.0)
-        loss_constraint = (phi(Tx).detach()).mean() - phi(Rz).mean() 
-        loss_R_total = (loss_Running + loss_constraint)
-        loss_R_total.backward()
-        torch.nn.utils.clip_grad_norm_(R2.parameters(), grad_clip)  # new
-        optR2.step()
-    
-        Rz, _     = R2(z, running=True)
-        
-        optphi.zero_grad()
-        phiRz = phi(Rz.detach())
-        phiTx = phi(Tx.detach())
-        loss_phi = phiRz.mean() - phiTx.mean()
-        phiRz2 = phiRz.pow(2).mean()
-        phiTx2 = phiTx.pow(2).mean()
-        
-        # Tx_noise = torch.randn(Tx.shape, device=device) * 2
-        Tx_noise = (Tx + torch.randn(Tx.shape, device=device) * 3e-1).detach()
-        Tx_noise = Tx_noise.requires_grad_(True)
-        phiTx = phi(Tx_noise)
-        grad_out  = torch.ones((Tx.shape[0],1), device=device, requires_grad=False)
-        grad      = autograd.grad( phiTx, Tx_noise, grad_out, create_graph=True, retain_graph=True, only_inputs=True )[0]
-        grad = grad.view(grad.shape[0], -1)
-        grad_norm = grad.pow(2).mean(1).pow(1).mean()
-        loss_phi += (grad_norm + 0.1 * phiTx2) * c
-        
-        Rz_noise = (Rz + torch.randn(Rz.shape, device=device) * 3e-1).detach()
-        Rz_noise = Rz_noise.requires_grad_(True)
-        phiRz  = phi(Rz_noise)
-        grad_out  = torch.ones((Rz.shape[0],1), device=device, requires_grad=False)
-        grad      = autograd.grad( phiRz, Rz_noise, grad_out, create_graph=True, retain_graph=True, only_inputs=True )[0]
-        grad = grad.view(grad.shape[0], -1)
-        grad_norm = grad.pow(2).mean(1).pow(1).mean()
-        loss_phi += (grad_norm + 0.1 * phiRz2) * c
-        
-        loss_phi.backward()
-        torch.nn.utils.clip_grad_norm_(phi.parameters(), grad_clip)  # new
-        optphi.step()
-        
 def get_n_by_n_images(imgs, nrow=5, ncol=5):
     # check if imgs values within [0,1]
     if torch.any((imgs > 1) | (imgs < 0)):
@@ -729,18 +508,6 @@ class Net_time(torch.nn.Module):
         super(Net_time, self).__init__()
         dd = 1000
         
-        # self.model = nn.Sequential(
-        #     nn.Linear(input_dim+1, dd),
-        #     nn.LeakyReLU(0.2, inplace=True),
-        #     nn.Linear(dd, dd),
-        #     nn.LeakyReLU(0.2, inplace=True),
-        #     nn.Linear(dd, dd),
-        #     nn.LeakyReLU(0.2, inplace=True),
-        #     nn.Linear(dd, dd),
-        #     nn.LeakyReLU(0.2, inplace=True),
-        #     nn.Linear(dd, output_dim),
-        # )
-
         ss = 4
         scale = 10*10*10
         dd = 500
