@@ -9,6 +9,8 @@ import os
 import torch
 from PIL import Image
 from natsort import natsorted
+from pathlib import Path
+from glob import glob
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd as autograd
@@ -155,7 +157,7 @@ class ToyDataset(torch.utils.data.Dataset):
         
   
 
-class CelebADataset(torch.utils.data.Dataset):
+class CelebADataset2(torch.utils.data.Dataset):
     def __init__(self, root_dir, transform=None):
         """
         Args:
@@ -187,7 +189,29 @@ class CelebADataset(torch.utils.data.Dataset):
 
         return img, 0
 
-  
+class CelebADataset(torch.utils.data.Dataset):
+    """
+    Minimal dataset that reads all jpg/png under root/images (no labels).
+    """
+    def __init__(self, root: Path, transform=None):
+        self.root = Path(root)
+        self.transform = transform
+        self.files = sorted(
+            glob(str(self.root / "images" / "*.jpg"))
+            + glob(str(self.root / "images" / "*.png"))
+        )
+        if not self.files:
+            raise RuntimeError(f"No images found under {self.root}/images")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        f = self.files[idx]
+        img = Image.open(f).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, 0  # unsupervised: no label
   
 class CustomCelebAHQ(torch.utils.data.Dataset):
     def __init__(self, image_dir, transform=None):
@@ -552,4 +576,160 @@ class Net(torch.nn.Module):
             t = torch.ones(x.shape[0],1,device=x.device)
         xt = torch.cat((x,t),1)
         return self.model(xt)
-    
+
+# =========================
+# Helpers for pixel-space FID-like
+# =========================
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def _compute_mean_and_cov(acts: torch.Tensor, eps: float = 1e-4):
+    """
+    acts: [N, D] float64 recommended
+    Returns mu [D], Sigma [D,D].
+    Uses unbiased covariance and strong diagonal loading for stability.
+    """
+    acts = acts.to(dtype=torch.float64)
+    mu = acts.mean(dim=0)
+    X = acts - mu
+    n = acts.shape[0]
+    if n < 2:
+        raise ValueError("Need at least two samples to compute covariance.")
+    Sigma = (X.t() @ X) / (n - 1)
+    # Symmetrize and load
+    Sigma = 0.5 * (Sigma + Sigma.t())
+    d = Sigma.shape[0]
+    Sigma = Sigma + eps * torch.eye(d, device=Sigma.device, dtype=Sigma.dtype)
+    return mu, Sigma
+
+@torch.no_grad()
+def _trace_sqrt_product(S1: torch.Tensor, S2: torch.Tensor, eps: float = 1e-8):
+    """
+    Compute tr( (S1^{1/2} S2 S1^{1/2})^{1/2} ) robustly.
+    Everything in float64. Clamp tiny negatives from roundoff.
+    """
+    S1 = 0.5 * (S1 + S1.t())
+    S2 = 0.5 * (S2 + S2.t())
+    # Eigendecomposition of S1
+    lam1, Q1 = torch.linalg.eigh(S1)
+    lam1 = torch.clamp(lam1, min=0.0)
+    S1h = (Q1 * torch.sqrt(lam1).unsqueeze(0)) @ Q1.t()  # S1^{1/2}
+
+    A = S1h @ S2 @ S1h
+    A = 0.5 * (A + A.t())
+    evals, _ = torch.linalg.eigh(A)
+    evals = torch.clamp(evals, min=0.0)
+    return torch.sum(torch.sqrt(evals + eps))
+
+@torch.no_grad()
+def frechet_distance_safe(mu1, S1, mu2, S2, eps: float = 1e-8):
+    """
+    Nonnegative by construction up to numerical eps; final clip at 0 for safety.
+    """
+    mu1 = mu1.to(dtype=torch.float64)
+    mu2 = mu2.to(dtype=torch.float64, device=mu1.device)
+    S1  = S1.to(dtype=torch.float64, device=mu1.device)
+    S2  = S2.to(dtype=torch.float64, device=mu1.device)
+
+    diff = mu1 - mu2
+    term_mean = diff.dot(diff)
+
+    ts = _trace_sqrt_product(S1, S2, eps=eps)
+    term_cov = torch.trace(S1) + torch.trace(S2) - 2.0 * ts
+
+    fid = term_mean + term_cov
+    # Guard against tiny negative from roundoff
+    return float(torch.clamp(fid, min=0.0).item())
+
+@torch.no_grad()
+def _resized_pixel_features_from_tensor(imgs: torch.Tensor, size=(32, 32), device=None, dtype=torch.float32, clamp_to_01=True, batch_size=256):
+    """
+    imgs: [N, C, H, W] on CPU or GPU. Returns [N, D] where D = C*size[0]*size[1].
+    """
+    if device is None:
+        device = imgs.device
+    N = imgs.shape[0]
+    feats = []
+    for i in range(0, N, batch_size):
+        x = imgs[i:i+batch_size].to(device=device, dtype=dtype)
+        if clamp_to_01 and x.max() > 1.5:
+            x = x / 255.0
+        # If your tensors are in [-1,1], map to [0,1] so both sets are consistent
+        if x.min() < 0 - 1e-4 or x.max() > 1 + 1e-4:
+            x = (x.clamp(-1, 1) + 1.0) / 2.0
+        x = F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+        feats.append(x.flatten(start_dim=1))
+    return torch.cat(feats, dim=0)
+
+@torch.no_grad()
+def _collect_real_images_from_loader(real_loader, N_real: int, device):
+    """
+    Iterates the loader and collects up to N_real images into a single tensor [N_real, C, H, W] on CPU.
+    """
+    imgs_list = []
+    n_collected = 0
+    for batch in real_loader:
+        if isinstance(batch, (list, tuple)):
+            imgs = batch[0]
+        else:
+            imgs = batch
+        imgs = imgs.detach().cpu()
+        imgs_list.append(imgs)
+        n_collected += imgs.shape[0]
+        if n_collected >= N_real:
+            break
+    real_imgs = torch.cat(imgs_list, dim=0)[:N_real].contiguous()
+    return real_imgs  # CPU
+
+@torch.no_grad()
+def _collect_generated_images(R, z_val, S_net, N_gen: int, zdim: int, Nt_push: int, scale: float, gen_chunk: int, device):
+    """
+    Generates N_gen samples in chunks: z ~ N(0, I), pushforward by R, decode by S_net.
+    Returns a CPU tensor [N_gen, C, H, W] and also the first chunk for visualization.
+    """
+    gen_list = []
+    n_gen = 0
+    first_chunk = None
+    while n_gen < N_gen:
+        b = min(gen_chunk, N_gen - n_gen)
+        z = z_val[n_gen:n_gen+b].to(device=device, dtype=torch.float32)
+        Rz = pushforward(R, z, Nt=Nt_push).detach() / scale
+        SRz = S_net(Rz).detach()  # keep model on device, move to CPU later
+        if first_chunk is None:
+            first_chunk = SRz[:min(25, b)].detach().cpu()
+        gen_list.append(SRz.cpu())
+        n_gen += b
+    gen_imgs = torch.cat(gen_list, dim=0)
+    return gen_imgs, first_chunk
+
+@torch.no_grad()
+def compute_fid_pixels_streaming(
+    R, z_val, S_net, zdim, real_loader,
+    N_gen: int, N_real: int,
+    Nt_push: int, scale: float,
+    gen_chunk: int = 256, real_chunk: int = 256,  # kept for symmetry with your old API
+    feat_size=(32, 32),
+    device=None,
+    dtype=torch.float32,
+    eps: float = 1e-6,
+):
+    """
+    Computes a FID-style Fréchet distance using resized pixel features.
+    Returns: fid_value (float), SRz_vis (a small batch for visualization).
+    """
+    device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+
+    # Collect reals and gens on CPU to avoid GPU memory spikes
+    real_imgs = _collect_real_images_from_loader(real_loader, N_real=N_real, device=device)   # [Nr, C, H, W] CPU
+    gen_imgs, SRz_vis = _collect_generated_images(R, z_val, S_net, N_gen=N_gen, zdim=zdim, Nt_push=Nt_push, scale=scale, gen_chunk=gen_chunk, device=device)
+
+    # Extract features (on GPU if available), streaming in mini-batches internally
+    feats_real = _resized_pixel_features_from_tensor(real_imgs, size=feat_size, device=device, dtype=dtype, batch_size=256)
+    feats_gen  = _resized_pixel_features_from_tensor(gen_imgs,  size=feat_size, device=device, dtype=dtype, batch_size=256)
+
+    mu_r, sig_r = _compute_mean_and_cov(feats_real, eps=eps)
+    mu_g, sig_g = _compute_mean_and_cov(feats_gen,  eps=eps)
+
+    fid_val = frechet_distance_safe(mu_r, sig_r, mu_g, sig_g, eps=eps)
+    return fid_val, SRz_vis  # SRz_vis is for your display panel
