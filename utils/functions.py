@@ -577,159 +577,191 @@ class Net(torch.nn.Module):
         xt = torch.cat((x,t),1)
         return self.model(xt)
 
-# =========================
-# Helpers for pixel-space FID-like
-# =========================
 import torch
 import torch.nn.functional as F
 
 @torch.no_grad()
-def _compute_mean_and_cov(acts: torch.Tensor, eps: float = 1e-4):
+def extract_features(data: torch.Tensor, size=(32, 32), out_dtype=torch.float32):
     """
-    acts: [N, D] float64 recommended
-    Returns mu [D], Sigma [D,D].
-    Uses unbiased covariance and strong diagonal loading for stability.
+    Vectorized resize+flatten-free 'feature' extractor.
+    Accepts [N,C,H,W] or [C,H,W]; uint8 [0,255] or float in [0,1] or [-1,1].
+    Returns a tensor of shape [N, C, size[0], size[1]] on the same device.
     """
-    acts = acts.to(dtype=torch.float64)
-    mu = acts.mean(dim=0)
-    X = acts - mu
-    n = acts.shape[0]
-    if n < 2:
-        raise ValueError("Need at least two samples to compute covariance.")
-    Sigma = (X.t() @ X) / (n - 1)
-    # Symmetrize and load
-    Sigma = 0.5 * (Sigma + Sigma.t())
-    d = Sigma.shape[0]
-    Sigma = Sigma + eps * torch.eye(d, device=Sigma.device, dtype=Sigma.dtype)
-    return mu, Sigma
+    x = data
+    if x.dim() == 3:                     # [C,H,W] -> [1,C,H,W]
+        x = x.unsqueeze(0)
+
+    # Convert to float in [0,1]
+    if x.dtype == torch.uint8:
+        x = x.float().div_(255)
+    elif x.dtype.is_floating_point:
+        # Map [-1,1] -> [0,1] if needed
+        if x.min() < -1e-4 or x.max() > 1 + 1e-4:
+            x = x.clamp(-1, 1)
+            x = (x + 1.0) / 2.0
+    else:
+        x = x.float()
+
+    # Batch resize on the same device (GPU-accelerated if x is on CUDA)
+    x = F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+
+    # Keep dtype consistent for downstream math
+    if x.dtype != out_dtype:
+        x = x.to(out_dtype)
+
+    return x.contiguous()
+
+
 
 @torch.no_grad()
-def _trace_sqrt_product(S1: torch.Tensor, S2: torch.Tensor, eps: float = 1e-8):
-    """
-    Compute tr( (S1^{1/2} S2 S1^{1/2})^{1/2} ) robustly.
-    Everything in float64. Clamp tiny negatives from roundoff.
-    """
-    S1 = 0.5 * (S1 + S1.t())
-    S2 = 0.5 * (S2 + S2.t())
-    # Eigendecomposition of S1
-    lam1, Q1 = torch.linalg.eigh(S1)
-    lam1 = torch.clamp(lam1, min=0.0)
-    S1h = (Q1 * torch.sqrt(lam1).unsqueeze(0)) @ Q1.t()  # S1^{1/2}
+def pushforward_scaled_chunked(R, z_all, Nt, scale, chunk_size=256, device=None):
+    device = device or (z_all.device if z_all.is_cuda else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    R.eval()
+    N = z_all.shape[0]
+    inv_scale = 1.0 / float(scale)
 
-    A = S1h @ S2 @ S1h
-    A = 0.5 * (A + A.t())
-    evals, _ = torch.linalg.eigh(A)
-    evals = torch.clamp(evals, min=0.0)
-    return torch.sum(torch.sqrt(evals + eps))
+    out = None
+    i0 = 0
+    while i0 < N:
+        i1 = min(i0 + chunk_size, N)
+        z_chunk = z_all[i0:i1].to(device)
+        Rz = pushforward(R, z_chunk, Nt=Nt)
+        Rz.mul_(inv_scale)                 # in-place scale, avoids new allocation
 
-@torch.no_grad()
-def frechet_distance_safe(mu1, S1, mu2, S2, eps: float = 1e-8):
-    """
-    Nonnegative by construction up to numerical eps; final clip at 0 for safety.
-    """
-    mu1 = mu1.to(dtype=torch.float64)
-    mu2 = mu2.to(dtype=torch.float64, device=mu1.device)
-    S1  = S1.to(dtype=torch.float64, device=mu1.device)
-    S2  = S2.to(dtype=torch.float64, device=mu1.device)
+        if out is None:
+            out = torch.empty((N, *Rz.shape[1:]), device=device, dtype=Rz.dtype)
 
-    diff = mu1 - mu2
-    term_mean = diff.dot(diff)
+        out[i0:i1].copy_(Rz)               # write into preallocated buffer
+        i0 = i1
 
-    ts = _trace_sqrt_product(S1, S2, eps=eps)
-    term_cov = torch.trace(S1) + torch.trace(S2) - 2.0 * ts
+    return out.detach()
 
-    fid = term_mean + term_cov
-    # Guard against tiny negative from roundoff
-    return float(torch.clamp(fid, min=0.0).item())
+# ===============================
+# Streaming FID with your formula + SRz preview
+# ===============================
+import torch
+import torch
 
 @torch.no_grad()
-def _resized_pixel_features_from_tensor(imgs: torch.Tensor, size=(32, 32), device=None, dtype=torch.float32, clamp_to_01=True, batch_size=256):
-    """
-    imgs: [N, C, H, W] on CPU or GPU. Returns [N, D] where D = C*size[0]*size[1].
-    """
-    if device is None:
-        device = imgs.device
-    N = imgs.shape[0]
-    feats = []
-    for i in range(0, N, batch_size):
-        x = imgs[i:i+batch_size].to(device=device, dtype=dtype)
-        if clamp_to_01 and x.max() > 1.5:
-            x = x / 255.0
-        # If your tensors are in [-1,1], map to [0,1] so both sets are consistent
-        if x.min() < 0 - 1e-4 or x.max() > 1 + 1e-4:
-            x = (x.clamp(-1, 1) + 1.0) / 2.0
-        x = F.interpolate(x, size=size, mode="bilinear", align_corners=False)
-        feats.append(x.flatten(start_dim=1))
-    return torch.cat(feats, dim=0)
-
-@torch.no_grad()
-def _collect_real_images_from_loader(real_loader, N_real: int, device):
-    """
-    Iterates the loader and collects up to N_real images into a single tensor [N_real, C, H, W] on CPU.
-    """
-    imgs_list = []
-    n_collected = 0
-    for batch in real_loader:
-        if isinstance(batch, (list, tuple)):
-            imgs = batch[0]
-        else:
-            imgs = batch
-        imgs = imgs.detach().cpu()
-        imgs_list.append(imgs)
-        n_collected += imgs.shape[0]
-        if n_collected >= N_real:
-            break
-    real_imgs = torch.cat(imgs_list, dim=0)[:N_real].contiguous()
-    return real_imgs  # CPU
-
-@torch.no_grad()
-def _collect_generated_images(R, z_val, S_net, N_gen: int, zdim: int, Nt_push: int, scale: float, gen_chunk: int, device):
-    """
-    Generates N_gen samples in chunks: z ~ N(0, I), pushforward by R, decode by S_net.
-    Returns a CPU tensor [N_gen, C, H, W] and also the first chunk for visualization.
-    """
-    gen_list = []
-    n_gen = 0
-    first_chunk = None
-    while n_gen < N_gen:
-        b = min(gen_chunk, N_gen - n_gen)
-        z = z_val[n_gen:n_gen+b].to(device=device, dtype=torch.float32)
-        Rz = pushforward(R, z, Nt=Nt_push).detach() / scale
-        SRz = S_net(Rz).detach()  # keep model on device, move to CPU later
-        if first_chunk is None:
-            first_chunk = SRz[:min(25, b)].detach().cpu()
-        gen_list.append(SRz.cpu())
-        n_gen += b
-    gen_imgs = torch.cat(gen_list, dim=0)
-    return gen_imgs, first_chunk
-
-@torch.no_grad()
-def compute_fid_pixels_streaming(
-    R, z_val, S_net, zdim, real_loader,
-    N_gen: int, N_real: int,
+def compute_fid_hadamard_streaming_fixed_z(
+    R, S_net, z_val, real_loader,
+    N_real: int,
     Nt_push: int, scale: float,
-    gen_chunk: int = 256, real_chunk: int = 256,  # kept for symmetry with your old API
-    feat_size=(32, 32),
+    gen_chunk: int = 256,
+    return_preview: int = 25,
     device=None,
-    dtype=torch.float32,
-    eps: float = 1e-6,
 ):
     """
-    Computes a FID-style Fréchet distance using resized pixel features.
-    Returns: fid_value (float), SRz_vis (a small batch for visualization).
+    Uses a fixed latent tensor z_val to compute:
+      fid = ||mu_real - mu_fake||^2 + tr(S_real + S_fake - 2 * sqrt(S_real ⊙ S_fake))
+    Returns (fid_value, SRz_vis) where SRz_vis is a small preview batch for plotting.
+
+    Assumes you have:
+      - extract_features(tensor, transform_resize)
+      - calculate_fid(real_features, fake_features)
     """
-    device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    R.eval()
 
-    # Collect reals and gens on CPU to avoid GPU memory spikes
-    real_imgs = _collect_real_images_from_loader(real_loader, N_real=N_real, device=device)   # [Nr, C, H, W] CPU
-    gen_imgs, SRz_vis = _collect_generated_images(R, z_val, S_net, N_gen=N_gen, zdim=zdim, Nt_push=Nt_push, scale=scale, gen_chunk=gen_chunk, device=device)
+    # 1) Collect exactly N_real real images
+    imgs_list, n_collected = [], 0
+    for batch in real_loader:
+        imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
+        take = min(imgs.size(0), N_real - n_collected)
+        if take > 0:
+            imgs_list.append(imgs[:take].contiguous())
+            n_collected += take
+        if n_collected >= N_real:
+            break
+    if n_collected < N_real:
+        raise ValueError(f"real_loader yielded only {n_collected} images, need {N_real}")
 
-    # Extract features (on GPU if available), streaming in mini-batches internally
-    feats_real = _resized_pixel_features_from_tensor(real_imgs, size=feat_size, device=device, dtype=dtype, batch_size=256)
-    feats_gen  = _resized_pixel_features_from_tensor(gen_imgs,  size=feat_size, device=device, dtype=dtype, batch_size=256)
+    x = torch.cat(imgs_list, dim=0).to(device, non_blocking=True)  # [N_real, C, H, W]
+    real_features = extract_features(x)
 
-    mu_r, sig_r = _compute_mean_and_cov(feats_real, eps=eps)
-    mu_g, sig_g = _compute_mean_and_cov(feats_gen,  eps=eps)
+    # 2) Generate using fixed z_val in chunks, embed per chunk
+    N_gen = z_val.size(0)
+    fake_feats_list = []
+    SRz_vis = None
+    inv_scale = 1.0 / float(scale)
 
-    fid_val = frechet_distance_safe(mu_r, sig_r, mu_g, sig_g, eps=eps)
-    return fid_val, SRz_vis  # SRz_vis is for your display panel
+    for i0 in range(0, N_gen, gen_chunk):
+        i1 = min(i0 + gen_chunk, N_gen)
+        z_chunk = z_val[i0:i1].to(device, non_blocking=True)
+
+        Rz  = pushforward(R, z_chunk, Nt=Nt_push)
+        Rz.mul_(inv_scale)
+        SRz = S_net(Rz)
+
+        if SRz_vis is None:
+            SRz_vis = SRz[:min(return_preview, SRz.size(0))].detach().cpu()
+
+        fake_feats_list.append(extract_features(SRz))
+
+    fake_features = torch.cat(fake_feats_list, dim=0)
+
+    # 3) Your FID computation
+    fid = calculate_fid(real_features, fake_features)
+
+    return float(fid), SRz_vis
+
+
+@torch.no_grad()
+def compute_fid_just_vae(
+    S_net, z_val, real_loader,
+    N_real: int,
+    gen_chunk: int = 256,
+    return_preview: int = 25,
+    device=None,
+):
+    """
+    Uses a fixed latent tensor z_val to compute:
+      fid = ||mu_real - mu_fake||^2 + tr(S_real + S_fake - 2 * sqrt(S_real ⊙ S_fake))
+    Returns (fid_value, SRz_vis) where SRz_vis is a small preview batch for plotting.
+
+    Assumes you have:
+      - extract_features(tensor, transform_resize)
+      - calculate_fid(real_features, fake_features)
+    """
+    # 1) Collect exactly N_real real images
+    imgs_list, n_collected = [], 0
+    for batch in real_loader:
+        imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
+        take = min(imgs.size(0), N_real - n_collected)
+        if take > 0:
+            imgs_list.append(imgs[:take].contiguous())
+            n_collected += take
+        if n_collected >= N_real:
+            break
+    if n_collected < N_real:
+        raise ValueError(f"real_loader yielded only {n_collected} images, need {N_real}")
+
+    x = torch.cat(imgs_list, dim=0).to(device, non_blocking=True)  # [N_real, C, H, W]
+    real_features = extract_features(x)
+
+    # 2) Generate using fixed z_val in chunks, embed per chunk
+    N_gen = z_val.size(0)
+    fake_feats_list = []
+    Sz_vis = None
+
+    for i0 in range(0, N_gen, gen_chunk):
+        i1 = min(i0 + gen_chunk, N_gen)
+        z_chunk = z_val[i0:i1].to(device, non_blocking=True)
+        Sz = S_net(z_chunk)
+        if Sz_vis is None:
+            Sz_vis = Sz[:min(return_preview, Sz.size(0))].detach().cpu()
+
+        fake_feats_list.append(extract_features(Sz))
+
+    fake_features = torch.cat(fake_feats_list, dim=0)
+
+    # 3) Your FID computation
+    fid = calculate_fid(real_features, fake_features)
+
+    return float(fid), Sz_vis
+
+
+
+# ------------ helper for display range ------------
+def to_disp(t: torch.Tensor) -> torch.Tensor:
+    # map [-1,1] -> [0,1] and clamp
+    return ((t.clamp(-1, 1) + 1.0) / 2.0).contiguous()
