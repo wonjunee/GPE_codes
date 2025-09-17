@@ -9,6 +9,7 @@ To use a different dataset, modify the data loader section accordingly.
 
 import argparse
 import sys
+import time
 import tqdm
 import numpy as np
 import os
@@ -41,10 +42,8 @@ print(args)
 
 # system preferences
 torch.set_default_dtype(torch.float)
-seed = np.random.randint(100)
-# seed = np.random.randint(101)
-np.random.seed(seed)
-torch.manual_seed(2)
+np.random.seed(1)
+torch.manual_seed(1)
 
 data_str = args.data.lower()
 
@@ -105,7 +104,7 @@ elif data_str == 'celeb':
 
 elif data_str == 'celebahq':
     from transportmodules.transportsCelebHQ import *
-    data_dir = '../data/celebahq/celeba_hq_256'
+    data_dir = (Path.cwd().parent / "data" / "celeba_hq_256" ).resolve() # path to celebA dataset (modify this path accordingly)
     zdim = 100
     scale = 0.1
     img_size = 256
@@ -159,14 +158,16 @@ if args.S_parallel:
 
 b1 = 0.5
 b2 = 0.999
-optS = torch.optim.Adam(S.parameters(), lr=4e-4, betas=(b1, b2))
+optS = torch.optim.Adam(S.parameters(), lr=1e-4, betas=(b1, b2))
 pbar = tqdm.tqdm(range(args.num_iter))
 recons_loss_arr = []
 
-
+# --- timing setup ---
+window = 1000                      # report every 1000 iterations
+t0 = time.time()                   # start time for overall average
+t_last = t0                        # start time for the current 1000-iter window
 
 plot_freq = 1000
-recons_loss_arr = []
 
 S.train()  # training mode
 # If T is a module and is FROZEN, you can keep it in eval to avoid randomness
@@ -186,12 +187,24 @@ while total_iterations < args.num_iter:
 
         pbar.set_description(f"recons loss: {loss.item():9.2e}")
 
-        # save every 1000 iterations
+        # --- every 'plot_freq' iterations, do validation, save model, and plot ---
         if total_iterations % 1000 == 0:
+            # --- timing block (prints every 'window' iters) ---
+            t_now = time.time()
+            dt_window = t_now - t_last
+            avg_ms_window = (dt_window / window) * 1000.0
+            dt_total = t_now - t0
+            avg_ms_total = (dt_total / (total_iterations+1)) * 1000.0
+            pbar.write(
+                f"[Timing] {window} iters: "
+                f"avg over last {window}: {avg_ms_window:.2f} ms/iter | "
+                f"overall avg: {avg_ms_total:.2f} ms/iter"
+            )
+
+            # --- save every 1000 iterations ---
             torch.save(S.state_dict(), f"{save_data_path}/S.pth")
 
-        # plot every plot_freq iterations
-        if total_iterations % plot_freq == 0:
+            # --- validation check and plotting ---
             S.eval()  # <-- IMPORTANT
             with torch.no_grad():
                 # make sure x_val has SAME preprocessing as training
@@ -200,38 +213,39 @@ while total_iterations < args.num_iter:
 
                 val_loss = (x_val - STx_val).pow(2).mean()
                 recons_loss_arr.append(val_loss.item())
-
-                # If you normalized with mean=std=0.5, unnormalize; else skip
-                def denorm(z):
-                    return (z * 0.5 + 0.5).clamp(0, 1)
-
-                n = 25
-                grid = make_grid(
-                    torch.cat([denorm(x_val[:n]), denorm(STx_val[:n])], dim=0),
-                    nrow=5
-                )
-
-                (Path(save_fig_path)).mkdir(parents=True, exist_ok=True)
-                save_image(grid, f"{save_fig_path}/recons_{total_iterations}.png")
-
-                # quick loss curve
-                plt.figure(figsize=(5,4))
-                xs = np.arange(len(recons_loss_arr)) * plot_freq
-                plt.plot(xs, recons_loss_arr)
-                plt.title(f"Reconstruction Loss (val)\nloss: {val_loss.item():9.2e}")
-                plt.xlabel("Iteration")
-                plt.ylabel("L2")
-                plt.yscale("log")
-                plt.tight_layout()
-                plt.savefig(f"{save_fig_path}/loss_{total_iterations}.png")
-                plt.close()
-
+                pbar.write(f"Validation loss at iteration {total_iterations}: {val_loss.item():9.2e}")
                 xs = np.arange(len(recons_loss_arr)) * plot_freq
                 np.savez(f"{save_data_path}/recons_loss_arr.npz", xs=xs, recons_loss_arr=np.array(recons_loss_arr))
 
+                if False:
+                    # If you normalized with mean=std=0.5, unnormalize; else skip
+                    def denorm(z):
+                        return (z * 0.5 + 0.5).clamp(0, 1)
+
+                    n = 25
+                    grid = make_grid(
+                        torch.cat([denorm(x_val[:n]), denorm(STx_val[:n])], dim=0),
+                        nrow=5
+                    )
+
+                    (Path(save_fig_path)).mkdir(parents=True, exist_ok=True)
+                    save_image(grid, f"{save_fig_path}/recons_{total_iterations}.png")
+
+                    # quick loss curve
+                    plt.figure(figsize=(5,4))
+                    xs = np.arange(len(recons_loss_arr)) * plot_freq
+                    plt.plot(xs, recons_loss_arr)
+                    plt.title(f"Reconstruction Loss (val)\nloss: {val_loss.item():9.2e}")
+                    plt.xlabel("Iteration")
+                    plt.ylabel("L2")
+                    plt.yscale("log")
+                    plt.tight_layout()
+                    plt.savefig(f"{save_fig_path}/loss_{total_iterations}.png")
+                    plt.close()
+
             S.train()  # back to train mode
+            t_last = t_now # reset last-time for next window
 
         total_iterations += 1
         pbar.update(1)
         pbar.set_postfix({"iter": total_iterations})
-
