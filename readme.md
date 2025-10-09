@@ -14,6 +14,8 @@
 
 This repository provides code for training Geometry-Preserving Encoder/Decoder (GPE)-based latent generative modeling on popular datasets such as MNIST, CIFAR10, CelebA, and CelebA-HQ (256x256). The implementation is modular and flexible, enabling users to easily adapt the code to experiment with other datasets of their choice. The code is written in Python and uses the PyTorch package for neural network training.
 
+Link to the paper: [https://arxiv.org/abs/2501.09876](https://arxiv.org/abs/2501.09876)
+
 
 
 ## Requirements
