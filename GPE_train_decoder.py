@@ -205,7 +205,7 @@ def main() -> None:
     print("Validation set shape:", tuple(x_val.shape))
 
     # Load pretrained encoder T
-    TransportT, TransportG = get_transport_classes(args.data)
+    TransportT, TransportG, _ = get_transport_classes(args.data)
 
     T = TransportT(input_shape=xshape, zdim=zdim).to(device)
     encoder_path = save_data_dir / args.encoder_ckpt
