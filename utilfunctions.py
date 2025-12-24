@@ -965,26 +965,17 @@ def get_transport_classes(data_str: str):
     """
     data_str = data_str.lower()
     if data_str == "mnist":
-        from transportmodules.transportsMNIST import TransportG, TransportT
-
-        return TransportT, TransportG
+        from transportmodules.transportsMNIST import TransportG, TransportT, NetSingle
     if data_str == "cifar":
-        from transportmodules.transportsCifar import TransportG, TransportT
-
-        return TransportT, TransportG
+        from transportmodules.transportsCifar import TransportG, TransportT, NetSingle
     if data_str == "celeb":
-        from transportmodules.transportsCeleb import TransportG, TransportT
-
-        return TransportT, TransportG
-
+        from transportmodules.transportsCeleb import TransportG, TransportT, NetSingle
     if data_str == "ffhq":
-        from transportmodules.transportsCeleb import TransportG, TransportT
-
-        return TransportT, TransportG
+        from transportmodules.transportsCeleb import TransportG, TransportT, NetSingle
     if data_str == "celebahq":
-        from transportmodules.transportsCelebHQ import TransportG, TransportT
+        from transportmodules.transportsCelebHQ import TransportG, TransportT, NetSingle
 
-        return TransportT, TransportG
+    return TransportT, TransportG, NetSingle
 
     raise ValueError(f"Unknown dataset for transports: {data_str}")
 
