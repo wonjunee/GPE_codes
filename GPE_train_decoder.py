@@ -1,251 +1,331 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 """
-This script trains the GPE decoder using the specified dataset after training the encoder.
-Supported datasets include: MNIST, CIFAR-10, CelebA, and CelebA-HQ.
+Train a GPE decoder S after a pretrained encoder T has been trained.
 
-To use a different dataset, modify the data loader section accordingly.
+Workflow:
+  1) Load dataset and build a training dataloader.
+  2) Load pretrained encoder weights T.pth.
+  3) Train decoder S to minimize reconstruction MSE:
+        loss = mean ||x - S(T(x))||^2
+  4) Every `--eval_every` iterations:
+        - compute validation reconstruction loss on a fixed batch x_val
+        - save the loss curve to .npz
+        - (optionally) save a checkpoint
+
+Assumptions:
+  - TransportT / TransportG and dataset wrappers (CelebADataset, CustomCelebAHQ, etc.)
+    are available in transportmodules.* as in your existing code.
+  - compute_reconstruction_loss_chunked(x_val, T, S, chunk_size=...) exists
+    (you showed it in utilfunctions.py).
 """
 
+from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
-import tqdm
-import numpy as np
-import os
-import torch
-import torch.nn.functional as F
-import torchvision.transforms as transforms
-from torchvision.utils import make_grid, save_image
 from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+import torch
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
 from torchvision import datasets
-from utils.functions import *
+import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7,8,9" 
-
-parser = argparse.ArgumentParser()
-
-# general arguments
-parser.add_argument('--num_iter', type=int, default=1_000_000)
-# arguments to choose dataset (mnist, cifar, cifar-gray etc.)
-parser.add_argument('--cuda', action='store_true')
-parser.add_argument('--plot_every', type=int, default=1)
-parser.add_argument('--batch_size', type=int, default=100)
-parser.add_argument('--saving', type=str, default="0")
-parser.add_argument('--fig', type=str, default="0")
-parser.add_argument('--data', type=str, default="celeb")
-parser.add_argument('--S_parallel', type=bool, default=False)
+from utilfunctions import *
 
 
-args = parser.parse_args()
-print(args)
+# ----------------------------
+# Repro / device helpers
+# ----------------------------
+def seed_everything(seed: int = 1) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-# system preferences
-torch.set_default_dtype(torch.float)
-np.random.seed(1)
-torch.manual_seed(1)
 
-data_str = args.data.lower()
+def set_visible_gpus(gpu_list: str | None) -> None:
+    """
+    Optionally set CUDA_VISIBLE_DEVICES to a comma-separated list like "0,1,2".
+    If gpu_list is None, do not override the environment.
+    """
+    if gpu_list is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_list
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-cuda = True if torch.cuda.is_available() else False
-Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
 
-if cuda:
-    num_gpus = torch.cuda.device_count()
-    print(f"XXX {num_gpus} GPU available XXX")
-else:
-    print("XXX GPU is not available XXX")
+def get_device(force_cuda_flag: bool = False) -> torch.device:
+    """
+    If force_cuda_flag=True, require CUDA.
+    Otherwise use CUDA if available.
+    """
+    if force_cuda_flag and not torch.cuda.is_available():
+        raise RuntimeError("--cuda was set but CUDA is not available.")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-if data_str == 'mnist':
-    from transportmodules.transportsMNIST import *
-    data_dir = '../data/mnist'
-    zdim = 30
-    img_size = 32
-    scale = 1.0
-    xshape = (1,img_size,img_size)
-    
-    # Transformations to be applied to each individual image sample
-    transform=transforms.Compose([ transforms.Resize(img_size), transforms.CenterCrop(img_size), transforms.ToTensor(), transforms.Normalize(mean=[0.5], std=[0.5])])
-    # Load the dataset from file and apply transformations
-    dataset_nn = datasets.MNIST(data_dir,download=True,transform=transform,)
-    PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100)
-elif data_str == 'cifar':
-    from transportmodules.transportsCifar import *
-    data_dir = '../data/cifar'
-    zdim = 50
-    scale = 1.0
-    img_size = 32
-    xshape = (3,img_size,img_size)
-    
-    mean = [0.5, 0.5, 0.5]
-    std = [0.5, 0.5, 0.5]
 
-    # Define transformations for data augmentation
-    transform = transforms.Compose(
-                    [transforms.Resize(img_size), transforms.ToTensor(), transforms.Normalize([0.5,0.5,0.5], [0.5,0.5,0.5])]
-                )
-    # Load the dataset from file and apply transformations
-    dataset_nn = datasets.CIFAR10(data_dir,download=False,transform=transform,)
-    PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100)
-elif data_str == 'celeb':
-    from transportmodules.transportsCeleb import *
-    # data_dir = '../data/CelebA/img_align_celeba'
-    data_dir = (Path.cwd().parent / "data" / "celebA" / "train" ).resolve() # path to celebA dataset (modify this path accordingly)
-    zdim = 100
-    scale = 0.3
-    img_size = 64
-    xshape = (3,img_size,img_size)
-    # Transformations to be applied to each individual image sample
-    transform=transforms.Compose([ transforms.Resize(img_size), transforms.CenterCrop(img_size), transforms.ToTensor(), transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
-    # Load the dataset from file and apply transformations
-    dataset_nn = CelebADataset(data_dir, transform)
-    PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100)
+# ----------------------------
+# Dataset / model imports
+# ----------------------------
+@torch.inference_mode()
+def collect_fixed_validation_batch(
+    dataloader: DataLoader,
+    device: torch.device,
+    n_samples: int,
+    non_blocking: bool,
+) -> torch.Tensor:
+    """
+    Collect a fixed validation batch of exactly n_samples images.
 
-elif data_str == 'celebahq':
-    from transportmodules.transportsCelebHQ import *
-    data_dir = (Path.cwd().parent / "data" / "celeba_hq_256" ).resolve() # path to celebA dataset (modify this path accordingly)
-    zdim = 100
-    scale = 0.1
-    img_size = 256
-    xshape = (3,img_size,img_size)
-    # Transformations to be applied to each individual image sample
-    transform=transforms.Compose([ transforms.Resize(img_size), transforms.CenterCrop(img_size), transforms.ToTensor(), transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
-    # Load the dataset from file and apply transformations
-    dataset_nn = CustomCelebAHQ(data_dir,transform=transform,)
-    PARAM = Parameters(batch_size=50, sample_size=1000, plot_freq=100)
-else:
-    print("wrong input for data")
-    sys.exit()
+    This avoids variation in validation curves from sampling different images
+    each time.
+    """
+    chunks = []
+    count = 0
+    for imgs, _ in dataloader:
+        need = n_samples - count
+        take = min(need, imgs.size(0))
+        chunks.append(imgs[:take].contiguous())
+        count += take
+        if count >= n_samples:
+            break
+    x_val = torch.cat(chunks, dim=0)
+    return x_val.to(device, non_blocking=non_blocking).detach()
 
-print(f'zdim: {zdim} scale: {scale} data: {args.data} saving: {args.saving}')
 
-img_skip = img_size // 32
+def save_loss_curve_npz(save_data_dir: Path, xs: np.ndarray, loss_arr: np.ndarray) -> None:
+    save_data_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(save_data_dir / "recons_loss_arr.npz", xs=xs, recons_loss_arr=loss_arr)
 
-# Whether to put fetched data tensors to pinned memory
-pin_memory = True if cuda else False
-# Number of workers for the dataloader
-num_workers = num_gpus * 8 if cuda else 0
-non_blocking = True if cuda else False
-    
-save_fig_path  = f'fig_{data_str}_{args.saving}_{args.fig}' ;os.makedirs(save_fig_path,  exist_ok=True);print(f"saving images in {save_fig_path}")
-save_data_path = f'data_{data_str}_{args.saving}';os.makedirs(save_data_path, exist_ok=True);print(f"saving data in {save_data_path}")
 
-# %% loading pretrained encoder
-dataloader = torch.utils.data.DataLoader(dataset_nn, batch_size=PARAM.batch_size, num_workers=num_workers, pin_memory=pin_memory, shuffle=True, drop_last=True)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
 
-# Collect 5000 samples from the validation dataloader
-validation_samples = []
-for imgs, _ in dataloader:
-    validation_samples.append(imgs)
-    if sum(batch.size(0) for batch in validation_samples) >= 5000:
-        break
+    # training
+    parser.add_argument("--num_iter", type=int, default=1_000_000)
+    parser.add_argument("--batch_size", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--beta1", type=float, default=0.5)
+    parser.add_argument("--beta2", type=float, default=0.999)
 
-# Concatenate and trim to exactly 5000 samples, ensure it's a torch.Tensor
-x_val = torch.cat(validation_samples, dim=0)[:5000]
-x_val = torch.as_tensor(x_val).to(device, non_blocking=non_blocking).detach()
-print(f"Validation set shape: {x_val.shape}")
+    # dataset / device
+    parser.add_argument("--data", type=str, default="celeb")
+    parser.add_argument("--cuda", action="store_true", help="Require CUDA; error if unavailable.")
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help='Optional CUDA_VISIBLE_DEVICES string like "0,1,2". If omitted, do not override.',
+    )
 
-T = TransportT(input_shape=xshape, zdim=zdim).to(device)
-T.load_state_dict(torch.load(f'{save_data_path}/T.pth', map_location=torch.device(device), weights_only=True))
-print(f"Encoder loaded.")
+    # validation / logging
+    parser.add_argument("--val_size", type=int, default=5000)
+    parser.add_argument("--eval_every", type=int, default=1000)
 
-# %% Training the decoder
-S = TransportG(output_shape=xshape,zdim=zdim).to(device)
+    # I/O tags (kept to preserve your folder naming)
+    parser.add_argument("--saving", type=str, default="0")
+    parser.add_argument("--fig", type=str, default="0")
 
-if args.S_parallel:
-    S = torch.nn.DataParallel(S).to(device)    
+    # model options
+    parser.add_argument(
+        "--S_parallel",
+        action="store_true",
+        help="Wrap decoder S in torch.nn.DataParallel.",
+    )
 
-b1 = 0.5
-b2 = 0.999
-optS = torch.optim.Adam(S.parameters(), lr=1e-4, betas=(b1, b2))
-pbar = tqdm.tqdm(range(args.num_iter))
-recons_loss_arr = []
+    # checkpointing
+    parser.add_argument(
+        "--encoder_ckpt",
+        type=str,
+        default="T.pth",
+        help="Filename of the pretrained encoder checkpoint inside the save_data_dir.",
+    )
+    parser.add_argument(
+        "--save_decoder_every",
+        type=int,
+        default=1000,
+        help="If > 0, save decoder checkpoint every N iterations.",
+    )
 
-# --- timing setup ---
-window = 1000                      # report every 1000 iterations
-t0 = time.time()                   # start time for overall average
-t_last = t0                        # start time for the current 1000-iter window
+    return parser.parse_args()
 
-plot_freq = 1000
 
-S.train()  # training mode
-# If T is a module and is FROZEN, you can keep it in eval to avoid randomness
-if isinstance(T, torch.nn.Module):
+def main() -> None:
+    args = parse_args()
+    print(args)
+
+    set_visible_gpus(args.gpus)
+    torch.set_default_dtype(torch.float32)
+    seed_everything(1)
+
+    device = get_device(force_cuda_flag=args.cuda)
+    cuda = device.type == "cuda"
+    num_gpus = torch.cuda.device_count() if cuda else 0
+    print(f"Device: {device} | GPUs visible: {num_gpus}" if cuda else f"Device: {device}")
+
+    # Dataset + config
+    dataset_nn, PARAM, img_size, xshape = build_dataset_and_params(args.data)
+    zdim = PARAM.zdim
+    scale = PARAM.scale
+    print(f"zdim: {zdim} | scale: {scale} | data: {args.data} | saving tag: {args.saving}")
+
+    # Dataloader settings
+    num_workers = (num_gpus * 8) if cuda else 0
+    pin_memory = bool(cuda)
+    non_blocking = bool(cuda)
+
+    dataloader = DataLoader(
+        dataset_nn,
+        batch_size=args.batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        shuffle=True,
+        drop_last=True,
+    )
+
+    # Output dirs (preserve your naming pattern)
+    data_str = args.data.lower()
+    save_fig_dir = Path(f"fig_{data_str}_{args.saving}_{args.fig}")
+    save_data_dir = Path(f"data_{data_str}_{args.saving}")
+    save_fig_dir.mkdir(parents=True, exist_ok=True)
+    save_data_dir.mkdir(parents=True, exist_ok=True)
+    print("saving figures in", save_fig_dir)
+    print("saving data in", save_data_dir)
+
+    # Fixed validation batch
+    x_val = collect_fixed_validation_batch(
+        dataloader,
+        device=device,
+        n_samples=args.val_size,
+        non_blocking=non_blocking,
+    )
+    print("Validation set shape:", tuple(x_val.shape))
+
+    # Load pretrained encoder T
+    TransportT, TransportG = get_transport_classes(args.data)
+
+    T = TransportT(input_shape=xshape, zdim=zdim).to(device)
+    encoder_path = save_data_dir / args.encoder_ckpt
+    if not encoder_path.exists():
+        raise FileNotFoundError(f"Encoder checkpoint not found: {encoder_path}")
+
+    # weights_only=True is available in newer PyTorch.
+    try:
+        state = torch.load(encoder_path, map_location=device, weights_only=True)
+    except TypeError:
+        state = torch.load(encoder_path, map_location=device)
+    T.load_state_dict(state)
+    print("Encoder loaded from", encoder_path)
+
+    # Freeze encoder: no grads, eval mode.
     T.eval()
+    for p in T.parameters():
+        p.requires_grad_(False)
 
-total_iterations = 0
-while total_iterations < args.num_iter:
-    for imgs, _ in dataloader:   # <-- iterate properly over the loader
-        x = imgs.to(device, non_blocking=non_blocking)
-        Tx = T(x).detach()
-        optS.zero_grad()
-        STx = S(Tx)
-        loss = (x - STx).pow(2).mean()
-        loss.backward()
-        optS.step()
+    C, C_stats = compute_scalar_scale_C_from_dataloader(
+        dataloader=dataloader,
+        encoder=T,
+        max_samples=5000,
+        device=device,
+    )
 
-        pbar.set_description(f"recons loss: {loss.item():9.2e}")
+    print("Computed C =", C)
 
-        # --- every 'plot_freq' iterations, do validation, save model, and plot ---
-        if total_iterations % 1000 == 0:
-            # --- timing block (prints every 'window' iters) ---
-            t_now = time.time()
-            dt_window = t_now - t_last
-            avg_ms_window = (dt_window / window) * 1000.0
-            dt_total = t_now - t0
-            avg_ms_total = (dt_total / (total_iterations+1)) * 1000.0
-            pbar.write(
-                f"[Timing] {window} iters: "
-                f"avg over last {window}: {avg_ms_window:.2f} ms/iter | "
-                f"overall avg: {avg_ms_total:.2f} ms/iter"
-            )
+    scale_payload = {
+        "C": float(C),
+        "stats": C_stats,
+        "dataset": args.data,
+    }
 
-            # --- save every 1000 iterations ---
-            torch.save(S.state_dict(), f"{save_data_path}/S.pth")
+    torch.save(scale_payload, save_data_dir / "scale.pth")
+    print("Saved scale to scale.pth")
 
-            # --- validation check and plotting ---
-            S.eval()  # <-- IMPORTANT
-            with torch.no_grad():
-                # make sure x_val has SAME preprocessing as training
-                Tx_val = T(x_val).detach()
-                STx_val = S(Tx_val)
+    T_scaled = lambda x: T(x) * scale_payload["C"]
 
-                val_loss = (x_val - STx_val).pow(2).mean()
-                recons_loss_arr.append(val_loss.item())
-                pbar.write(f"Validation loss at iteration {total_iterations}: {val_loss.item():9.2e}")
+    # Decoder S
+    S = TransportG(output_shape=xshape, zdim=zdim).to(device)
+    if args.S_parallel:
+        # DataParallel expects the model on CUDA and will replicate across visible GPUs
+        S = torch.nn.DataParallel(S).to(device)
+
+    optS = torch.optim.Adam(S.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
+
+    # Tracking
+    recons_loss_arr: list[float] = []
+    plot_freq = int(args.eval_every)
+
+    pbar = tqdm.tqdm(total=args.num_iter)
+
+    # Timing
+    window = plot_freq
+    t0 = time.time()
+    t_last = t0
+
+    # Training loop
+    S.train()
+    total_iterations = 0
+    while total_iterations < args.num_iter:
+        for imgs, _ in dataloader:
+            if total_iterations >= args.num_iter:
+                break
+
+            x = imgs.to(device, non_blocking=non_blocking)
+
+            # Forward through frozen encoder
+            Tx = T_scaled(x).detach()
+
+            # Train decoder
+            optS.zero_grad(set_to_none=True)
+            STx = S(Tx)
+            loss = (x - STx).pow(2).mean()
+            loss.backward()
+            optS.step()
+
+            total_iterations += 1
+            pbar.update(1)
+            pbar.set_description(f"recons loss: {loss.item():.2e}")
+            pbar.set_postfix({"iter": total_iterations})
+
+            # Periodic validation / plotting
+            if total_iterations % args.eval_every == 0:
+                # Timing report
+                t_now = time.time()
+                dt_window = t_now - t_last
+                avg_ms_window = (dt_window / max(window, 1)) * 1000.0
+                avg_ms_total = ((t_now - t0) / max(total_iterations, 1)) * 1000.0
+                pbar.write(
+                    f"[Timing] last {window} iters: {avg_ms_window:.2f} ms/iter | "
+                    f"overall: {avg_ms_total:.2f} ms/iter"
+                )
+
+                # Validation reconstruction loss on fixed batch
+                S.eval()
+                with torch.inference_mode():
+                    # Uses your helper from utilfunctions.py (as in your snippet).
+                    val_loss = compute_reconstruction_loss_chunked(x_val, T_scaled, S, chunk_size=100)
+                recons_loss_arr.append(float(val_loss))
+
+                pbar.write(f"[Val] iter {total_iterations}: recon loss = {val_loss:.2e}")
+
                 xs = np.arange(len(recons_loss_arr)) * plot_freq
-                np.savez(f"{save_data_path}/recons_loss_arr.npz", xs=xs, recons_loss_arr=np.array(recons_loss_arr))
+                save_loss_curve_npz(save_data_dir, xs=xs, loss_arr=np.array(recons_loss_arr))
 
-                if False:
-                    # If you normalized with mean=std=0.5, unnormalize; else skip
-                    def denorm(z):
-                        return (z * 0.5 + 0.5).clamp(0, 1)
+                # Optional: save decoder checkpoint
+                if args.save_decoder_every and (total_iterations % args.save_decoder_every == 0):
+                    ckpt_path = save_data_dir / f"S.pth"
+                    # If S is DataParallel, save the underlying module
+                    to_save = S.module.state_dict() if isinstance(S, torch.nn.DataParallel) else S.state_dict()
+                    torch.save(to_save, ckpt_path)
+                    pbar.write(f"[Save] decoder checkpoint -> {ckpt_path}")
 
-                    n = 25
-                    grid = make_grid(
-                        torch.cat([denorm(x_val[:n]), denorm(STx_val[:n])], dim=0),
-                        nrow=5
-                    )
+                S.train()
+                t_last = t_now
 
-                    (Path(save_fig_path)).mkdir(parents=True, exist_ok=True)
-                    save_image(grid, f"{save_fig_path}/recons_{total_iterations}.png")
+    pbar.close()
 
-                    # quick loss curve
-                    plt.figure(figsize=(5,4))
-                    xs = np.arange(len(recons_loss_arr)) * plot_freq
-                    plt.plot(xs, recons_loss_arr)
-                    plt.title(f"Reconstruction Loss (val)\nloss: {val_loss.item():9.2e}")
-                    plt.xlabel("Iteration")
-                    plt.ylabel("L2")
-                    plt.yscale("log")
-                    plt.tight_layout()
-                    plt.savefig(f"{save_fig_path}/loss_{total_iterations}.png")
-                    plt.close()
 
-            S.train()  # back to train mode
-            t_last = t_now # reset last-time for next window
-
-        total_iterations += 1
-        pbar.update(1)
-        pbar.set_postfix({"iter": total_iterations})
+if __name__ == "__main__":
+    main()
