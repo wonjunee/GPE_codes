@@ -243,7 +243,8 @@ def main() -> None:
     torch.save(scale_payload, save_data_dir / "scale.pth")
     print("Saved scale to scale.pth")
 
-    T_scaled = lambda x: T(x) * scale_payload["C"]
+    def T_scale(x: torch.Tensor) -> torch.Tensor:
+        return T(x) * scale_payload["C"]
 
     # Decoder S
     S = TransportG(output_shape=xshape, zdim=zdim).to(device)
@@ -275,7 +276,7 @@ def main() -> None:
             x = imgs.to(device, non_blocking=non_blocking)
 
             # Forward through frozen encoder
-            Tx = T_scaled(x).detach()
+            Tx = T_scale(x).detach()
 
             # Train decoder
             optS.zero_grad(set_to_none=True)
@@ -305,7 +306,7 @@ def main() -> None:
                 S.eval()
                 with torch.inference_mode():
                     # Uses your helper from utilfunctions.py (as in your snippet).
-                    val_loss = compute_reconstruction_loss_chunked(x_val, T_scaled, S, chunk_size=100)
+                    val_loss = compute_reconstruction_loss_chunked(x_val, T_scale, S, chunk_size=100)
                 recons_loss_arr.append(float(val_loss))
 
                 pbar.write(f"[Val] iter {total_iterations}: recon loss = {val_loss:.2e}")
