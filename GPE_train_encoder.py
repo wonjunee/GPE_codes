@@ -207,7 +207,7 @@ def main() -> None:
     print("saving data in", save_data_dir)
 
     # Model
-    TransportT, _ = get_transport_classes(args.data)
+    TransportT, _, _ = get_transport_classes(args.data)
     T = TransportT(input_shape=xshape, zdim=zdim).to(device)
 
     optT = torch.optim.Adam(T.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
