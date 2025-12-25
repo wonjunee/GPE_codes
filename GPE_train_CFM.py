@@ -40,42 +40,6 @@ import tqdm
 
 from utilfunctions import *
 
-
-# ----------------------------
-# Repro / device helpers
-# ----------------------------
-def seed_everything(seed: int) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def get_device(require_cuda: bool) -> torch.device:
-    if require_cuda and not torch.cuda.is_available():
-        raise RuntimeError("--cuda was set but CUDA is not available.")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def safe_torch_load(path: Path, device: torch.device):
-    """
-    weights_only=True exists in newer PyTorch. Fall back cleanly for older versions.
-    """
-    try:
-        return torch.load(path, map_location=device, weights_only=True)
-    except TypeError:
-        return torch.load(path, map_location=device)
-
-
-def maybe_wrap_dataparallel(model: torch.nn.Module, force: bool, device: torch.device) -> torch.nn.Module:
-    """
-    Wrap in DataParallel if requested and CUDA is available.
-    """
-    if force and device.type == "cuda":
-        return torch.nn.DataParallel(model).to(device)
-    return model.to(device)
-
-
 @torch.inference_mode()
 def collect_validation_batch(
     loader: DataLoader,
@@ -122,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fid_real", type=int, default=1000)       # number of real samples for your FID formula
     parser.add_argument("--fid_gen", type=int, default=1000)        # z_val size
     parser.add_argument("--Nt_plot", type=int, default=10)
-    parser.add_argument("--save_R_every", type=int, default=10_000)
+    parser.add_argument("--save_R_every", type=int, default=1_000)
 
     # parallelism
     parser.add_argument("--S_parallel", action="store_true", help="Wrap S in DataParallel")
@@ -153,7 +117,7 @@ def main() -> None:
     seed = int(np.random.randint(100))
     seed_everything(seed)
 
-    device = get_device(require_cuda=args.cuda)
+    device = get_device(force_cuda_flag=args.cuda)
     cuda = device.type == "cuda"
     num_gpus = torch.cuda.device_count() if cuda else 0
     print(f"Device: {device} | GPUs visible: {num_gpus}" if cuda else f"Device: {device}")
@@ -204,7 +168,6 @@ def main() -> None:
     # Load pretrained T and S
     # ----------------------------
     T = TransportT(input_shape=xshape, zdim=zdim)
-    T = maybe_wrap_dataparallel(T, force=args.T_parallel, device=device)
     T_ckpt = safe_torch_load(save_data_dir / "T.pth", device=device)
     scale_payload = safe_torch_load(save_data_dir / "scale.pth", device=device)
 
@@ -214,6 +177,7 @@ def main() -> None:
     else:
         T.load_state_dict(T_ckpt)
     print("Loaded encoder T.")
+    T = maybe_wrap_dataparallel(T, force=args.T_parallel, device=device)
 
     # Freeze encoder and define scaling wrapper
     T.eval()
@@ -347,8 +311,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-        sys.exit(0)
+    main()
