@@ -201,7 +201,7 @@ def main() -> None:
     C, C_stats = compute_scalar_scale_C_from_dataloader(
         dataloader=dataloader,
         encoder=T,
-        max_samples=5000,
+        max_samples=10_000,
         device=device,
     )
 
