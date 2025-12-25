@@ -1062,3 +1062,53 @@ def compute_scalar_scale_C_from_dataloader(
     }
     return float(C), stats
 
+
+
+# ----------------------------
+# Repro / device helpers
+# ----------------------------
+def seed_everything(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+
+def get_device(force_cuda_flag: bool = False) -> torch.device:
+    """
+    If force_cuda_flag=True, require CUDA.
+    Otherwise use CUDA if available.
+    """
+    if force_cuda_flag and not torch.cuda.is_available():
+        raise RuntimeError("--cuda was set but CUDA is not available.")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+
+def safe_torch_load(path: Path, device: torch.device):
+    """
+    weights_only=True exists in newer PyTorch. Fall back cleanly for older versions.
+    """
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def maybe_wrap_dataparallel(model: torch.nn.Module, force: bool, device: torch.device) -> torch.nn.Module:
+    """
+    Wrap in DataParallel if requested and CUDA is available.
+    """
+    if force and device.type == "cuda":
+        return torch.nn.DataParallel(model).to(device)
+    return model.to(device)
+
+
+def set_visible_gpus(gpu_list: str | None) -> None:
+    """
+    Set CUDA_VISIBLE_DEVICES if user provided a list like "0,1,2".
+    If None, do nothing (use the environment default).
+    """
+    if gpu_list is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_list
