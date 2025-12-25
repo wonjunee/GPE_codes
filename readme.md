@@ -29,11 +29,33 @@ Link to the paper: [https://arxiv.org/abs/2501.09876](https://arxiv.org/abs/2501
 
 ## Contents
 
-- `GPE_train_encoder.py`: This script is used for training the GPE encoder.
-- `GPE_train_decoder.py`: After training the encoder using `GPE_train_encoder.py`, this script can be used to train the GPE decoder.
-- `GPE_train_CFM.py`: After training both the encoder and the decoder, this script can be used to train the flow map in the latent space based on the conditional flow matching algorithm. This part can be easily replaced with other flow-based generative models such as diffusion models or normalizing flows.
-- `/utils`: A folder containing accessory Python scripts used in the code.
-- `/transportmodules`: A folder containing the modules used for each dataset. Different neural network architectures can be easily implemented here.
+The repository is organized around a modular training pipeline for geometry-preserving encoders and latent-space generative modeling.
+
+- **`GPE_train_encoder.py`**  
+  This script is used to train the **GPE encoder**, which maps data from the ambient space into a latent space while enforcing geometry-preserving properties.  
+  The encoder is optimized using the GPE objective, which balances reconstruction fidelity with invariance and geometric consistency under data perturbations or corruptions.  
+  The trained encoder defines the latent representation used in all subsequent stages.
+
+- **`GPE_train_decoder.py`**  
+  After the encoder has been trained using `GPE_train_encoder.py`, this script is used to train the **GPE decoder**.  
+  The decoder maps latent variables back to the ambient data space, ensuring consistency with the fixed encoder and enabling reconstruction or generation.  
+  Training the decoder separately preserves the geometric properties learned by the encoder and simplifies both implementation and analysis.
+
+- **`GPE_train_CFM.py`**  
+  After training both the encoder and decoder, this script is used to train a **latent-space generative model** based on the conditional flow matching (CFM) algorithm.  
+  The generative model operates entirely in the latent space, which typically improves conditioning and accelerates training.  
+  This component is modular and can be easily replaced by other flow-based generative models such as diffusion models or normalizing flows.
+
+- **`/utils/`**  
+  A directory containing **utility and accessory scripts** shared across the codebase.  
+  These scripts include data preprocessing and normalization routines, scaling utilities, logging and checkpoint management, numerical diagnostics, and other common helper functions.  
+  The utilities are designed to be independent of any specific training stage.
+
+- **`/transportmodules/`**  
+  A directory containing **dataset-specific transport modules**, including neural network architectures and data-dependent components.  
+  Each module defines the encoder, decoder, and latent generative model appropriate for a given dataset.  
+  New datasets or architectures can be added by implementing additional modules in this directory, without modifying the main training scripts.
+
 
 ## How to use (example with MNIST)
 
