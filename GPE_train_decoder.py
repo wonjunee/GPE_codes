@@ -37,36 +37,6 @@ import tqdm
 
 from utilfunctions import *
 
-
-# ----------------------------
-# Repro / device helpers
-# ----------------------------
-def seed_everything(seed: int = 1) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def set_visible_gpus(gpu_list: str | None) -> None:
-    """
-    Optionally set CUDA_VISIBLE_DEVICES to a comma-separated list like "0,1,2".
-    If gpu_list is None, do not override the environment.
-    """
-    if gpu_list is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_list
-
-
-def get_device(force_cuda_flag: bool = False) -> torch.device:
-    """
-    If force_cuda_flag=True, require CUDA.
-    Otherwise use CUDA if available.
-    """
-    if force_cuda_flag and not torch.cuda.is_available():
-        raise RuntimeError("--cuda was set but CUDA is not available.")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
 # ----------------------------
 # Dataset / model imports
 # ----------------------------
@@ -130,6 +100,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fig", type=str, default="0")
 
     # model options
+    parser.add_argument(
+        "--T_parallel",
+        action="store_false",
+        help="Wrap encoder T in torch.nn.DataParallel.",
+    )
     parser.add_argument(
         "--S_parallel",
         action="store_true",
@@ -207,18 +182,16 @@ def main() -> None:
     # Load pretrained encoder T
     TransportT, TransportG, _ = get_transport_classes(args.data)
 
-    T = TransportT(input_shape=xshape, zdim=zdim).to(device)
-    encoder_path = save_data_dir / args.encoder_ckpt
-    if not encoder_path.exists():
-        raise FileNotFoundError(f"Encoder checkpoint not found: {encoder_path}")
+    T = TransportT(input_shape=xshape, zdim=zdim)
+    T_ckpt = safe_torch_load(save_data_dir / "T.pth", device=device)
 
-    # weights_only=True is available in newer PyTorch.
-    try:
-        state = torch.load(encoder_path, map_location=device, weights_only=True)
-    except TypeError:
-        state = torch.load(encoder_path, map_location=device)
-    T.load_state_dict(state)
-    print("Encoder loaded from", encoder_path)
+    # Support both raw and {"state_dict": ...} formats
+    if isinstance(T_ckpt, dict) and "state_dict" in T_ckpt:
+        T.load_state_dict(T_ckpt["state_dict"])
+    else:
+        T.load_state_dict(T_ckpt)
+    print("Loaded encoder T.")
+    T = maybe_wrap_dataparallel(T, force=args.T_parallel, device=device)
 
     # Freeze encoder: no grads, eval mode.
     T.eval()
