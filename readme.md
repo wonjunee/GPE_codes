@@ -46,10 +46,13 @@ The repository is organized around a modular training pipeline for geometry-pres
   The generative model operates entirely in the latent space, which typically improves conditioning and accelerates training.  
   This component is modular and can be easily replaced by other flow-based generative models such as diffusion models or normalizing flows.
 
+- **`utilfunctions.py`**
+This file contains **shared utility functions** that support all stages of the training pipeline, including encoder training, decoder training, and latent-space generative modeling.  
+The functions in this file are intentionally kept model-agnostic and provide common numerical, statistical, and training-related operations used throughout the codebase.
+
+
 - **`/utils/`**  
   A directory containing **utility and accessory scripts** shared across the codebase.  
-  These scripts include data preprocessing and normalization routines, scaling utilities, logging and checkpoint management, numerical diagnostics, and other common helper functions.  
-  The utilities are designed to be independent of any specific training stage.
 
 - **`/transportmodules/`**  
   A directory containing **dataset-specific transport modules**, including neural network architectures and data-dependent components.  
