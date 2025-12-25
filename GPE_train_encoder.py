@@ -40,36 +40,6 @@ import tqdm
 
 from utilfunctions import *
 
-
-# ----------------------------
-# Repro / device helpers
-# ----------------------------
-def seed_everything(seed: int = 1) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def set_visible_gpus(gpu_list: str | None) -> None:
-    """
-    Set CUDA_VISIBLE_DEVICES if user provided a list like "0,1,2".
-    If None, do nothing (use the environment default).
-    """
-    if gpu_list is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_list
-
-
-def get_device(force_cuda_flag: bool = False) -> torch.device:
-    """
-    If force_cuda_flag=True, require CUDA (error if unavailable).
-    Otherwise use CUDA if available.
-    """
-    if force_cuda_flag and not torch.cuda.is_available():
-        raise RuntimeError("--cuda was set but CUDA is not available.")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
 # ----------------------------
 # Dataset setup
 # ----------------------------
@@ -143,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         help='Optional CUDA_VISIBLE_DEVICES string like "0,1,2". If omitted, do not override.',
     )
 
+    parser.add_argument(
+        "--T_parallel",
+        action="store_false",
+        help="Wrap encoder T in torch.nn.DataParallel.",
+    )
+
     # validation / logging
     parser.add_argument("--val_size", type=int, default=1000, help="Size of the fixed validation batch.")
     parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate and plot every N iterations.")
@@ -209,6 +185,9 @@ def main() -> None:
     # Model
     TransportT, _, _ = get_transport_classes(args.data)
     T = TransportT(input_shape=xshape, zdim=zdim).to(device)
+    if args.T_parallel:
+        # DataParallel expects the model on CUDA and will replicate across visible GPUs
+        T = torch.nn.DataParallel(T).to(device)
 
     optT = torch.optim.Adam(T.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
 
@@ -269,7 +248,11 @@ def main() -> None:
                 )
 
                 # save checkpoint
-                torch.save(T.state_dict(), save_data_dir / "T.pth")
+                ckpt_path = save_data_dir / f"T.pth"
+                # If T is DataParallel, save the underlying module
+                to_save = T.module.state_dict() if isinstance(T, torch.nn.DataParallel) else T.state_dict()
+                torch.save(to_save, ckpt_path)
+                pbar.write(f"[Save] encoder checkpoint -> {ckpt_path}")
 
                 T.train()
                 t_last = t_now
