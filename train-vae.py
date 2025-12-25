@@ -257,7 +257,6 @@ def parse_args() -> argparse.Namespace:
 
     # Training loop
     parser.add_argument("--num_iter", type=int, default=10_000_000)
-    parser.add_argument("--num_epochs", type=int, default=10000)  # not really used in this loop
     parser.add_argument("--starting_epoch", type=int, default=0)
 
     # Dataset + run naming
@@ -271,8 +270,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trial", type=str, default="1")
 
     # Logging / saving
-    parser.add_argument("--save_freq", type=int, default=25)  # unused, preserved
-    parser.add_argument("--plot_freq", type=int, default=1000)  # use this
+    parser.add_argument("--plot_freq", type=int, default=5_000)  # use this
     parser.add_argument("--load", type=int, default=0)
 
     # Device
@@ -364,7 +362,7 @@ def main() -> None:
     # ----------------------------
     # Transport encoder output dim is zdim*10 in your original.
     # Then fc_mu/logvar maps hidden_dim=zdim*10 -> zdim.
-    TransportT, TransportG = get_transport_classes(args.data)
+    TransportT, TransportG, _ = get_transport_classes(args.data)
 
     lr = 1e-5
     b1, b2 = 0.5, 0.999
