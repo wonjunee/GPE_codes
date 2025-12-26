@@ -279,8 +279,8 @@ def parse_args() -> argparse.Namespace:
 
     # Loss toggles and weights
     parser.add_argument("--use_recon", type=int, default=1, help="0 disables recon loss.")
-    parser.add_argument("--kld_wt", type=float, default=0.5)
-    parser.add_argument("--mds_wt", type=float, default=1.0)
+    parser.add_argument("--kld_wt", type=float, default=0.1)
+    parser.add_argument("--mds_wt", type=float, default=0.0)
 
     # Plotting option
     parser.add_argument("--plt_wted", type=int, default=1)
