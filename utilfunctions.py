@@ -621,7 +621,6 @@ def pushforward_scaled_chunked(R, z_all, Nt, scale, chunk_size=256, device=None)
     device = device or (z_all.device if z_all.is_cuda else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     R.eval()
     N = z_all.shape[0]
-    inv_scale = 1.0 / float(scale)
 
     out = None
     i0 = 0
@@ -629,7 +628,6 @@ def pushforward_scaled_chunked(R, z_all, Nt, scale, chunk_size=256, device=None)
         i1 = min(i0 + chunk_size, N)
         z_chunk = z_all[i0:i1].to(device)
         Rz = pushforward(R, z_chunk, Nt=Nt)
-        Rz.mul_(inv_scale)                 # in-place scale, avoids new allocation
 
         if out is None:
             out = torch.empty((N, *Rz.shape[1:]), device=device, dtype=Rz.dtype)
@@ -649,7 +647,7 @@ import torch
 def compute_fid_hadamard_streaming_fixed_z(
     R, S_net, z_val, real_loader,
     N_real: int,
-    Nt_push: int, scale: float,
+    Nt_push: int, 
     gen_chunk: int = 256,
     return_preview: int = 25,
     device=None,
@@ -685,14 +683,12 @@ def compute_fid_hadamard_streaming_fixed_z(
     N_gen = z_val.size(0)
     fake_feats_list = []
     SRz_vis = None
-    inv_scale = 1.0 / float(scale)
 
     for i0 in range(0, N_gen, gen_chunk):
         i1 = min(i0 + gen_chunk, N_gen)
         z_chunk = z_val[i0:i1].to(device, non_blocking=True)
 
         Rz  = pushforward(R, z_chunk, Nt=Nt_push)
-        Rz.mul_(inv_scale)
         SRz = S_net(Rz)
 
         if SRz_vis is None:
@@ -851,12 +847,70 @@ def compute_reconstruction_loss_chunked(x_val, T, S, chunk_size=100):
     return total_sq_error / total_count
 
 
-def build_dataset_and_params(data_str: str):
+def build_dataset_and_params(data_str: str, augmentation: bool = True):
     """
     Returns:
       dataset_nn, PARAM, img_size, xshape
+
+    New:
+      augmentation (bool):
+        If True, apply mild augmentations at data loading time:
+          - random horizontal flip
+          - slight random resized crop (mild zoom/crop)
+          - random gaussian blur
+
+    Notes:
+      - Augmentations are applied in the dataset's transform pipeline (PIL-space),
+        before ToTensor/Normalize.
+      - For MNIST, flips are usually not label-preserving. Since you asked for the
+        listed augmentations, this still enables them if augmentation=True,
+        but you may want to keep augmentation=False for MNIST in practice.
     """
     data_str = data_str.lower()
+
+    def make_transform(
+        *,
+        img_size: int,
+        is_gray: bool,
+        do_augment: bool,
+    ) -> transforms.Compose:
+        # Base preprocessing (resize/crop) + optional augmentation + tensor + normalize
+        tfs = []
+
+        if do_augment:
+            # "slight resize": mild RandomResizedCrop (close to original size)
+            tfs.append(
+                transforms.RandomResizedCrop(
+                    size=img_size,
+                    scale=(0.95, 1.0),
+                    ratio=(0.95, 1.05),
+                    antialias=True,
+                )
+            )
+            # side-way flip
+            tfs.append(transforms.RandomHorizontalFlip(p=0.5))
+            # gaussian blur (mild, applied with small probability)
+            # kernel must be odd
+            k = 7 if img_size >= 64 else 3
+            tfs.append(
+                transforms.RandomApply(
+                    [transforms.GaussianBlur(kernel_size=k, sigma=(0.1, 2.0))],
+                    p=0.15,
+                )
+            )
+        else:
+            # Deterministic preprocessing
+            tfs.append(transforms.Resize(img_size))
+            tfs.append(transforms.CenterCrop(img_size))
+
+        tfs.append(transforms.ToTensor())
+
+        if is_gray:
+            tfs.append(transforms.Normalize(mean=[0.5], std=[0.5]))
+        else:
+            tfs.append(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]))
+
+        return transforms.Compose(tfs)
 
     if data_str == "mnist":
         from transportmodules.transportsMNIST import TransportG, TransportT  # noqa: F401
@@ -865,14 +919,8 @@ def build_dataset_and_params(data_str: str):
         img_size = 32
         xshape = (1, img_size, img_size)
 
-        transform = transforms.Compose(
-            [
-                transforms.Resize(img_size),
-                transforms.CenterCrop(img_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5], std=[0.5]),
-            ]
-        )
+        transform = make_transform(img_size=img_size, is_gray=True, do_augment=augmentation)
+
         dataset_nn = datasets.MNIST(data_dir, download=True, transform=transform)
         PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=30, scale=1.0)
         return dataset_nn, PARAM, img_size, xshape
@@ -884,79 +932,54 @@ def build_dataset_and_params(data_str: str):
         img_size = 32
         xshape = (3, img_size, img_size)
 
-        transform = transforms.Compose(
-            [
-                transforms.Resize(img_size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-            ]
-        )
+        transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
+
         dataset_nn = datasets.CIFAR10(data_dir, download=True, transform=transform)
         PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=50, scale=1.0)
         return dataset_nn, PARAM, img_size, xshape
 
     if data_str == "celeb":
-        from transportmodules.transportsCeleb import TransportG, TransportT
+        from transportmodules.transportsCeleb import TransportG, TransportT  # noqa: F401
 
         data_dir = (Path.cwd().parent / "data" / "celebA" / "train").resolve()
         img_size = 64
         xshape = (3, img_size, img_size)
 
-        transform = transforms.Compose(
-            [
-                transforms.Resize(img_size),
-                transforms.CenterCrop(img_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
+        transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
+
         dataset_nn = CelebADataset(data_dir, transform)
         PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=100, scale=0.3)
         return dataset_nn, PARAM, img_size, xshape
 
     if data_str == "ffhq":
-        from transportmodules.transportsCeleb import TransportG, TransportT
+        from transportmodules.transportsCeleb import TransportG, TransportT  # noqa: F401
 
-        # NOTE: original code uses celebA train path for both celeb and ffhq.
-        # If FFHQ is separate in your setup, change this path.
+        # NOTE: you currently point FFHQ to celebA. Keep as-is unless you have a separate FFHQ path.
         data_dir = (Path.cwd().parent / "data" / "celebA" / "train").resolve()
         img_size = 64
         xshape = (3, img_size, img_size)
 
-        transform = transforms.Compose(
-            [
-                transforms.Resize(img_size),
-                transforms.CenterCrop(img_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
+        transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
+
         dataset_nn = CelebADataset(data_dir, transform)
         PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=100, scale=0.3)
         return dataset_nn, PARAM, img_size, xshape
 
     if data_str == "celebahq":
-        from transportmodules.transportsCelebHQ import TransportG, TransportT
+        from transportmodules.transportsCelebHQ import TransportG, TransportT  # noqa: F401
 
-        data_dir = (Path.cwd().parent / "data" / "celeba_hq_256").resolve()
+        data_dir = (Path.cwd().parent / "data" / "celeba_hq_256" / "images").resolve()
         img_size = 256
         xshape = (3, img_size, img_size)
 
-        transform = transforms.Compose(
-            [
-                transforms.Resize(img_size),
-                transforms.CenterCrop(img_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
+        transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
+
         dataset_nn = CustomCelebAHQ(data_dir, transform=transform)
         PARAM = Parameters(batch_size=50, sample_size=1000, plot_freq=100, zdim=100, scale=0.1)
         return dataset_nn, PARAM, img_size, xshape
 
     print(f"Unknown dataset: {data_str}")
     sys.exit(1)
-
 
 def get_transport_classes(data_str: str):
     """
