@@ -1,44 +1,26 @@
 from typing import Tuple
-import argparse
 import sys
 import tqdm
-import json
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import os
 import math
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from natsort import natsorted
 from pathlib import Path
 from glob import glob
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.autograd as autograd
 import torchvision.transforms as transforms
-from torchvision.utils import save_image
+from torchvision.utils import make_grid, save_image
 from torchvision import datasets
-import contextlib
+import scipy.linalg
+import pickle
+
 
 from PIL import Image, ImageFilter, ImageOps
-
-class AddBlurredBorder:
-    def __init__(self, border_size=4, blur_radius=4):
-        self.border_size = border_size
-        self.blur_radius = blur_radius
-
-    def __call__(self, img):
-        # Create a border around the image
-        bordered_image = ImageOps.expand(img, border=self.border_size, fill=0)
-        
-        # Create a blurred version of the bordered image
-        blurred_image = bordered_image.filter(ImageFilter.GaussianBlur(self.blur_radius))
-        
-        # Paste the original image on top of the blurred image
-        bordered_image.paste(img, (self.border_size, self.border_size))
-        
-        return bordered_image
 
 def get_latent_samples(shape, device):
     return torch.randn(shape, device=device)
@@ -46,76 +28,6 @@ def get_latent_samples(shape, device):
 def swap_axes_images(img):
     img = np.transpose(img, (1,2,0))
     return img
-
-def preprocessing_data(dataset_nn, device, sample_size = 1000, reduced=32):
-    """Getting ready with the dataset: x validation set and precomputed mu and sigma for FID.
-
-    Args:
-        dataset_nn (torch dataset): Dataset given (MNIST, CIFAR10, CelebA, etc)
-        device (str): cpu or gpu
-        sample_size (int, optional): the number of samples for validation. Defaults to 1000.
-
-    Returns:
-        torch vectors, dict: x validations with a size sample_size, dictionary containing arrays of computed mu and sigma.
-    """
-    ## Load the dataset 
-    dataloader2= torch.utils.data.DataLoader(dataset_nn, batch_size=sample_size, shuffle=True, drop_last=True)
-    
-    for _, (imgs, _) in enumerate(dataloader2):
-        x_val = imgs.to(device)
-        img_size = x_val.shape[2]
-        break
-    
-    def calculate_fid_compute_mu_sigma(real_embeddings):
-        real_embeddings      = real_embeddings.reshape((real_embeddings.shape[0],-1))
-        mu, sigma = torch.mean(real_embeddings, dim=0), torch.cov(real_embeddings.t())
-        return mu, sigma
-
-    # compute mu and sigma of the real data in the beginning
-    real_mu_sigma = {'mu':[], 'sigma':[]}
-    img_skip = img_size // reduced
-    for i, (imgs, _) in enumerate(dataloader2):
-        x = imgs.to(device) # Images
-        mu, sigma = calculate_fid_compute_mu_sigma(x[:,:,::img_skip,::img_skip])
-        real_mu_sigma['mu'].append(mu)
-        real_mu_sigma['sigma'].append(sigma)
-        if i > 10:
-            break
-    del dataloader2
-    return x_val, real_mu_sigma
-
-def calculate_fid(real_embeddings, generated_embeddings):
-    real_embeddings      = real_embeddings.reshape((real_embeddings.shape[0],-1))
-    generated_embeddings = generated_embeddings.reshape((generated_embeddings.shape[0],-1))
-    mu1, sigma1 = torch.mean(real_embeddings, dim=0), torch.cov(real_embeddings.t())
-    mu2, sigma2 = torch.mean(generated_embeddings, dim=0), torch.cov(generated_embeddings.t())
-    # Calculate sum squared difference between means
-    ssdiff = torch.sum((mu1 - mu2)**2.0)
-    # Calculate square root of the product between covariances
-    covmean = torch.sqrt(torch.mul(sigma1, sigma2))
-    # Convert to real part if complex
-    if covmean.is_complex():
-        covmean = covmean.real
-    # Calculate FID score
-    fid = ssdiff + torch.trace(sigma1 + sigma2 - 2.0 * covmean)
-    return fid.item()  # Convert to scalar value
-
-def calculate_fid2(real_mu_sigma, i, generated_embeddings):
-    generated_embeddings = generated_embeddings.reshape((generated_embeddings.shape[0],-1))
-    mu1, sigma1 = real_mu_sigma['mu'][i], real_mu_sigma['sigma'][i]
-    mu2, sigma2 = torch.mean(generated_embeddings, dim=0), torch.cov(generated_embeddings.t())
-    # Calculate sum squared difference between means
-    ssdiff = torch.sum((mu1 - mu2)**2.0)
-    # Calculate square root of the product between covariances
-    covmean = torch.sqrt(torch.mul(sigma1, sigma2))
-    # Convert to real part if complex
-    if covmean.is_complex():
-        covmean = covmean.real
-    # Calculate FID score
-    fid = ssdiff + torch.trace(sigma1 + sigma2 - 2.0 * covmean)
-    return fid.item()  # Convert to scalar value
-
-
 
 class ToyDataset(torch.utils.data.Dataset):
     def __init__(self, sigma=0.1, n_mode=8, dim=20, size=30_000):
@@ -159,39 +71,6 @@ class ToyDataset(torch.utils.data.Dataset):
         return point, index
         
   
-
-class CelebADataset2(torch.utils.data.Dataset):
-    def __init__(self, root_dir, transform=None):
-        """
-        Args:
-            root_dir (string): Directory with all the images
-            transform (callable, optional): transform to be applied to each image sample
-        """
-        # Read names of images in the root directory
-        # image_names0 = os.listdir(root_dir)
-        # image_names = glob.glob(f'{root_dir}/*.jpg')
-        image_names = []
-        for it in os.listdir(root_dir):
-            if '.jpg' in it:
-                image_names.append(it)
-        self.root_dir = root_dir
-        self.transform = transform 
-        self.image_names = natsorted(image_names)
-
-    def __len__(self): 
-        return len(self.image_names)
-
-    def __getitem__(self, idx):
-        # Get the path to the image 
-        img_path = os.path.join(self.root_dir, self.image_names[idx])
-        # Load image and convert it to RGB
-        img = Image.open(img_path).convert('RGB')
-        # Apply transformations to the image
-        if self.transform:
-            img = self.transform(img)
-
-        return img, 0
-
 class CelebADataset(torch.utils.data.Dataset):
     """
     Minimal dataset that reads all jpg/png under root/images (no labels).
@@ -202,6 +81,30 @@ class CelebADataset(torch.utils.data.Dataset):
         self.files = sorted(
             glob(str(self.root / "images" / "*.jpg"))
             + glob(str(self.root / "images" / "*.png"))
+        )
+        if not self.files:
+            raise RuntimeError(f"No images found under {self.root}/images")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        f = self.files[idx]
+        img = Image.open(f).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, 0  # unsupervised: no label
+
+class FFHQDataset(torch.utils.data.Dataset):
+    """
+    Minimal dataset that reads all jpg/png under root/images (no labels).
+    """
+    def __init__(self, root: Path, transform=None):
+        self.root = Path(root)
+        self.transform = transform
+        self.files = sorted(
+            glob(str(self.root / "*.jpg"))
+            + glob(str(self.root / "*.png"))
         )
         if not self.files:
             raise RuntimeError(f"No images found under {self.root}/images")
@@ -240,120 +143,73 @@ class CustomCelebAHQ(torch.utils.data.Dataset):
         return image, 0 # the second one is nothing. This is just for the consistency with the other dataset
 
 
-class Velocity(torch.nn.Module):
-    def __init__(self):
-        super(Velocity, self).__init__()
+import torch
 
-    def get_close_samples(self,z,x):
-        t = torch.rand(x.shape[0], 1, device=x.device)
-        z_noise = z + torch.randn(x.shape, device=x.device) * 0.3
-        x_z = (z_noise.reshape((z.shape[0],1,z.shape[1])) - x.reshape((1,x.shape[0],x.shape[1]))).pow(2).mean(2)
-        ind = torch.argmin(x_z, dim=1)
-        x_ind = x[ind]
-        xt = (1-t)*z + t*x_ind
-        ut = x_ind - z
-        return t.detach(), xt.detach(), ut.detach()
+@torch.no_grad()
+def pushforward(net, x0, Nt=10, eps=1e-4):
+    """
+    Forward integration (e.g., noise to data).
+    Uses an epsilon buffer to avoid t=0 and t=1 singularities.
+    """
+    # Create a safe time grid from eps to 1.0 - eps
+    t_steps = torch.linspace(eps, 1.0 - eps, Nt + 1)
     
-    def compute_u1(self, x, z, sigma, t=0):
-        return (x-z) * (1.0 + t * (1.0/sigma - 1)) + (1. - t) * z, (x-z) * (1.0/sigma - 1) - z
-    
-    def compute_u1_xz(self, x, z, t):
-        return (1-t)*z + t*x, x - z
-    
-
-    def compute_u1_xz2(self, x1, x2, z1, z2, t):
-        d11 = (x1-z1).pow(2).mean(1)
-        d12 = (x1-z2).pow(2).mean(1)
-        d21 = (x2-z1).pow(2).mean(1)
-        d22 = (x2-z2).pow(2).mean(1)
-        
-        mask = (d11 + d22 < d12 + d21) * 1
-        mask = mask.reshape((-1,1))
-        # 1-1, 2-2
-        xz1, u1 = ((1-t)*z1 + t*x1)*mask + ((1-t)*z1 + t*x2)*(1-mask), (x1 - z1)*mask +  (x2 - z1)*(1-mask)
-        xz2, u2 = ((1-t)*z2 + t*x2)*mask + ((1-t)*z2 + t*x1)*(1-mask), (x2 - z2)*mask +  (x1 - z2)*(1-mask)
-        return xz1, xz2, u1, u2 
-    
-    def compute_velocity_cost_new(self, net, x, z, C=0):
-        t = torch.rand(x.shape[0],1,device=x.device)
-        x1,u1 = self.compute_u1_xz(x.detach(), z.detach(), t)
-        xx = x1.detach() + C * (1 - (2*(t-0.5)).pow(2)) * (torch.rand(x.shape,device=x.device)-0.5)
-        value = (net(xx.detach(), t) - u1.detach()).pow(2).mean()
-        return value
-
-    def compute_velocity_cost_bfm(self, net, x, z):
-        xx = x.detach()
-        zz = z.detach()
-        value = 0
-        t = torch.rand(x.shape[0],1,device=x.device)
-        xz, u = self.compute_u1_bfm(x, z, t)
-        value += (net(xz.detach(),t) - u.detach()).pow(2).mean()
-        return value
-    
-
-    def compute_velocity_cost_new_ot(self, net, x, z, C=0.0):
-        x1 = x[:x.shape[0]//2,:].detach()
-        x2 = x[x.shape[0]//2:,:].detach()
-        z1 = z[:z.shape[0]//2,:].detach()
-        z2 = z[z.shape[0]//2:,:].detach()
-        t = torch.rand(x1.shape[0],1,device=x1.device)
-        eps = C * (1 - (2*(t-0.5)).pow(2)) * (torch.rand(x1.shape,device=x1.device)-0.5)
-        eps = eps.detach()
-        xz1,xz2,u1,u2 = self.compute_u1_xz2(x1, x2, z1, z2, t)
-        value = (net(xz1.detach()+eps,t) - u1.detach()).pow(2).mean() + (net(xz2.detach()+eps,t) - u2.detach()).pow(2).mean()
-        return value
-    
-    def forward(self, net, x, inv=False, Nt=None):
-        xx = x.detach()
-        tau = 1./Nt
-        
-        if inv:
-            x1 = xx
-            for i in range(Nt):
-                x1 = odeint(net, x1, 1-i * tau, 1-(i+1) * tau)
-            xresult = x1
-        else:
-            x0 = xx
-            for i in range(Nt):
-                x0 = odeint(net, x0, i * tau, (i+1) * tau)
-            xresult = x0
-        return xresult
-    
-    def interpolate(self, net, x, Nt=5, inv=False):
-        xx = x * 1.0
-        tau = 1.0/Nt
-        arr = torch.zeros((Nt+1,x.shape[0],x.shape[1]))
-        
-        if inv==True:
-            arr[-1] = xx.detach()
-            x1 = xx
-            for i in range(Nt):
-                v1 = net(x1,1-i/Nt)
-                x1 = x1 - v1 * tau # + torch.randn(x1.shape, device=x1.device) * 0.1
-                arr[-1-i-1] = x1.detach()
-        else:
-            arr[0] = xx.detach()
-            x1 = xx
-            for i in range(Nt):
-                v1 = net(x1,i/Nt)
-                x1 = x1 + v1 * tau # + torch.randn(x1.shape, device=x1.device) * 0.1
-                arr[i+1] = x1.detach()
-        return arr    
-    
-        
-def pushforward(net, x0, Nt=10):
-    tau = 1./Nt
     for i in range(Nt):
-        x0 = odeint(net, x0.detach(), i * tau, (i+1) * tau)
-    return x0.detach()
+        t0 = t_steps[i].item()
+        t1 = t_steps[i+1].item()
+        x0 = odeint2(net, x0, t0, t1) # Assuming odeint2 is your solver
+        
+    return x0
 
-def pushforward_inv(net, x0, Nt=10):
-    tau = 1./Nt
-    for i in range(Nt):
-        x0 = odeint(net, x0.detach(), 1 - i * tau, 1 - (i+1) * tau)
-    return x0.detach()
+@torch.no_grad()
+def pushforward_inv(net, x0, Nt=10, eps=1e-4):
+    """
+    Backward integration (e.g., data to noise).
+    Uses an epsilon buffer to avoid t=1 and t=0 singularities.
+    """
+    # Create a safe time grid stepping backwards from 1.0 - eps to eps
+    t_steps = torch.linspace(1.0 - eps, eps, Nt + 1)
     
-def odeint(odefun, z, t0, t1):
+    for i in range(Nt):
+        t0 = t_steps[i].item()
+        t1 = t_steps[i+1].item()
+        x0 = odeint2(net, x0, t0, t1)
+        
+    return x0
+
+def odeint1(odefun, z, t0, t1):
+    """
+        Forward Euler integration scheme
+    :param odefun: function to apply at every time step
+    :param z:      tensor nex-by-d+4, inputs
+    :param t0:     float, starting time
+    :param t1:     float, end time
+    """
+    
+    h = t1 - t0 # step size
+    z0 = z
+    z = z0 + h * odefun(z0, t = t0)
+    return z        
+
+def odeint2(odefun, z, t0, t1): # Heun
+    """
+        Heun's method (Runge-Kutta 2nd order)
+    """
+    h = t1 - t0
+    
+    # Step 1: Compute velocity at current state (1st eval)
+    k1 = odefun(z, t=t0)
+    
+    # Step 2: Estimate intermediate state
+    z_intermediate = z + h * k1
+    
+    # Step 3: Compute velocity at intermediate state (2nd eval)
+    k2 = odefun(z_intermediate, t=t1)
+    
+    # Final step: Average the velocities
+    return z + (h / 2.0) * (k1 + k2)
+
+def odeint4(odefun, z, t0, t1):
     """
         Runge-Kutta 4 integration scheme
     :param odefun: function to apply at every time step
@@ -379,7 +235,7 @@ def odeint(odefun, z, t0, t1):
     K = h * odefun( z0 + K , t = t0+h )
     z = z + (1.0/6.0) * K
 
-    return z        
+    return z      
 
 def cdist_squared(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     # a: (n, d), b: (m, d)
@@ -489,6 +345,8 @@ class Parameters:
         self.MAX_OUTER_ITER = MAX_OUTER_ITER
         self.zdim = zdim
         self.scale = scale
+    def print(self):
+        print(f"zdim: {self.zdim}, batch_size: {self.batch_size}")
       
 class Pbar:
     def __init__(self, dataloader, use_tqdm=0, desc="", leave=False):
@@ -509,82 +367,10 @@ class Pbar:
             self.range_dataloader.write(str0)
     def __call__(self):
         return self.range()
-    
-class Net2(torch.nn.Module):
-    def __init__(self, input_dim = 100, output_dim = 100):
-        super(Net2, self).__init__()
-        dd = 1000
-        
-        self.model = nn.Sequential(
-            nn.Linear(input_dim, dd),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(dd, dd),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(dd, dd),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(dd, dd),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(dd, output_dim),
-        )
 
-    def forward(self, x):
-        return self.model(x)
-    
-class Net_time(torch.nn.Module):
-    def __init__(self, input_dim = 100, output_dim = 100):
-        super(Net_time, self).__init__()
-        dd = 1000
-        
-        ss = 4
-        scale = 10*10*10
-        dd = 500
-        self.model = nn.Sequential(
-                nn.Linear(input_dim+1, ss*scale),
-                nn.LeakyReLU(0.2, inplace=True),
-                nn.Unflatten(1, (1, ss*scale)),
-                nn.Conv1d(1, dd, kernel_size=11, stride=10, padding=5),
-                nn.LeakyReLU(0.2, inplace=True), # 1000
-                nn.Conv1d(dd, dd*2, kernel_size=11, stride=10, padding=5),
-                nn.LeakyReLU(0.2, inplace=True), # 100
-                nn.Conv1d(dd*2, dd*4, kernel_size=11, stride=10, padding=5),
-                nn.LeakyReLU(0.2, inplace=True), # 10
-                nn.Conv1d(dd*4, 1, kernel_size=ss, stride=1, padding=0),
-                nn.Flatten(),
-        )
-
-    def forward(self, x, t):
-        if isinstance(t, float):
-            t = torch.ones(x.shape[0],1, device=x.device) * t
-        return self.model(torch.cat((x,t),1))
-
-class Net(torch.nn.Module):
-    def __init__(self, input_dim = 100, output_dim = 100):
-        super(Net, self).__init__()
-        dd = 500
-        
-        self.model = nn.Sequential(
-            nn.Linear(input_dim+1, dd),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(dd, dd),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(dd, dd),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(dd, dd),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(dd, output_dim),
-        )
-
-    def forward(self, x, t):
-        if isinstance(t, float):
-            t = torch.ones(x.shape[0],1,device=x.device)
-        xt = torch.cat((x,t),1)
-        return self.model(xt)
-
-import torch
-import torch.nn.functional as F
 
 @torch.no_grad()
-def extract_features(data: torch.Tensor, size=(32, 32), out_dtype=torch.float32):
+def extract_features(data: torch.Tensor, size=(32,32), out_dtype=torch.float32):
     """
     Vectorized resize+flatten-free 'feature' extractor.
     Accepts [N,C,H,W] or [C,H,W]; uint8 [0,255] or float in [0,1] or [-1,1].
@@ -640,8 +426,64 @@ def pushforward_scaled_chunked(R, z_all, Nt, scale, chunk_size=256, device=None)
 # ===============================
 # Streaming FID with your formula + SRz preview
 # ===============================
-import torch
-import torch
+def compute_fid_pixel_streaming_fixed_z(
+    R, z_val, real_loader,
+    N_real: int,
+    Nt_push: int, 
+    gen_chunk: int = 256,
+    return_preview: int = 25,
+    device=None,
+):
+    """
+    Uses a fixed noise tensor z_val (in pixel dimensions) to compute:
+      fid = ||mu_real - mu_fake||^2 + tr(S_real + S_fake - 2 * sqrt(S_real  S_fake))
+    Returns (fid_value, Rz_vis) where Rz_vis is a small preview batch for plotting.
+    
+    Assumes you have:
+      - extract_features(tensor)
+      - calculate_fid(real_features, fake_features)
+    """
+    R.eval()
+
+    # 1) Collect exactly N_real real images
+    imgs_list, n_collected = [], 0
+    for batch in real_loader:
+        imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
+        take = min(imgs.size(0), N_real - n_collected)
+        if take > 0:
+            imgs_list.append(imgs[:take].contiguous())
+            n_collected += take
+        if n_collected >= N_real:
+            break
+    if n_collected < N_real:
+        raise ValueError(f"real_loader yielded only {n_collected} images, need {N_real}")
+
+    x = torch.cat(imgs_list, dim=0).to(device, non_blocking=True)  
+    real_features = extract_features(x)
+
+    # 2) Generate using fixed z_val in chunks, embed per chunk
+    N_gen = z_val.size(0)
+    fake_feats_list = []
+    Rz_vis = None
+
+    for i0 in range(0, N_gen, gen_chunk):
+        i1 = min(i0 + gen_chunk, N_gen)
+        z_chunk = z_val[i0:i1].to(device, non_blocking=True)
+
+        # In pixel space, pushforward directly outputs the image
+        Rz  = pushforward(R, z_chunk, Nt=Nt_push)
+
+        if Rz_vis is None:
+            Rz_vis = Rz[:min(return_preview, Rz.size(0))].detach().cpu()
+
+        fake_feats_list.append(extract_features(Rz))
+
+    fake_features = torch.cat(fake_feats_list, dim=0)
+
+    # 3) Compute FID
+    fid = calculate_fid(real_features, fake_features)
+
+    return float(fid), Rz_vis
 
 @torch.no_grad()
 def compute_fid_hadamard_streaming_fixed_z(
@@ -889,15 +731,16 @@ def build_dataset_and_params(data_str: str, augmentation: bool = True):
             )
             # side-way flip
             tfs.append(transforms.RandomHorizontalFlip(p=0.5))
+
             # gaussian blur (mild, applied with small probability)
             # kernel must be odd
-            k = 7 if img_size >= 64 else 3
-            tfs.append(
-                transforms.RandomApply(
-                    [transforms.GaussianBlur(kernel_size=k, sigma=(0.1, 2.0))],
-                    p=0.15,
-                )
-            )
+            # k = 3 if img_size >= 64 else 3
+            # tfs.append(
+            #     transforms.RandomApply(
+            #         [transforms.GaussianBlur(kernel_size=k, sigma=(0.1, 2.0))],
+            #         p=0.15,
+            #     )
+            # )
         else:
             # Deterministic preprocessing
             tfs.append(transforms.Resize(img_size))
@@ -948,13 +791,13 @@ def build_dataset_and_params(data_str: str, augmentation: bool = True):
         transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
 
         dataset_nn = CelebADataset(data_dir, transform)
+        # dataset_nn = datasets.CelebA(root='../data', split='train', transform=transform, download=True)
         PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=100, scale=0.3)
         return dataset_nn, PARAM, img_size, xshape
 
-    if data_str == "ffhq":
-        from transportmodules.transportsCeleb import TransportG, TransportT  # noqa: F401
+    if data_str == "celeb2": # lightweight version
+        from transportmodules.transportsCeleb2 import TransportG, TransportT  # noqa: F401
 
-        # NOTE: you currently point FFHQ to celebA. Keep as-is unless you have a separate FFHQ path.
         data_dir = (Path.cwd().parent / "data" / "celebA" / "train").resolve()
         img_size = 64
         xshape = (3, img_size, img_size)
@@ -962,10 +805,64 @@ def build_dataset_and_params(data_str: str, augmentation: bool = True):
         transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
 
         dataset_nn = CelebADataset(data_dir, transform)
+        # dataset_nn = datasets.CelebA(root='../data', split='train', transform=transform, download=True)
         PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=100, scale=0.3)
         return dataset_nn, PARAM, img_size, xshape
 
-    if data_str == "celebahq":
+    if data_str == "celeb3": # lightweight version
+        from transportmodules.transportsCeleb3 import TransportG, TransportT  # noqa: F401
+
+        data_dir = (Path.cwd().parent / "data" / "celebA" / "train").resolve()
+        img_size = 64
+        xshape = (3, img_size, img_size)
+
+        transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
+
+        dataset_nn = CelebADataset(data_dir, transform)
+        # dataset_nn = datasets.CelebA(root='../data', split='train', transform=transform, download=True)
+        PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=100, scale=0.3)
+        return dataset_nn, PARAM, img_size, xshape
+
+    if data_str == "celeb4": # lightweight version
+        from transportmodules.transportsCeleb4 import TransportG, TransportT  # noqa: F401
+
+        data_dir = (Path.cwd().parent / "data" / "celebA" / "train").resolve()
+        img_size = 64
+        xshape = (3, img_size, img_size)
+
+        transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
+
+        dataset_nn = CelebADataset(data_dir, transform)
+        # dataset_nn = datasets.CelebA(root='../data', split='train', transform=transform, download=True)
+        PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=512, scale=0.3)
+        return dataset_nn, PARAM, img_size, xshape
+
+
+    if data_str == "ffhq":
+        # NOTE: you currently point FFHQ to celebA. Keep as-is unless you have a separate FFHQ path.
+        data_dir = (Path.cwd().parent / "data" / "ffhqimages" / "thumbnails128x128" ).resolve()
+        img_size = 64
+        xshape = (3, img_size, img_size)
+
+        transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
+
+        dataset_nn = FFHQDataset(data_dir, transform)
+        PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=512, scale=0.3)
+        return dataset_nn, PARAM, img_size, xshape
+
+    if data_str == "ffhq2":
+        # NOTE: you currently point FFHQ to celebA. Keep as-is unless you have a separate FFHQ path.
+        data_dir = (Path.cwd().parent / "data" / "ffhqimages" / "thumbnails128x128" ).resolve()
+        img_size = 64
+        xshape = (3, img_size, img_size)
+
+        transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
+
+        dataset_nn = FFHQDataset(data_dir, transform)
+        PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=100, scale=0.3)
+        return dataset_nn, PARAM, img_size, xshape
+
+    if data_str == "celebahq": # heavy architecture
         from transportmodules.transportsCelebHQ import TransportG, TransportT  # noqa: F401
 
         data_dir = (Path.cwd().parent / "data" / "celeba_hq_256" / "images").resolve()
@@ -978,6 +875,23 @@ def build_dataset_and_params(data_str: str, augmentation: bool = True):
         PARAM = Parameters(batch_size=50, sample_size=1000, plot_freq=100, zdim=100, scale=0.1)
         return dataset_nn, PARAM, img_size, xshape
 
+
+    # -------------------------
+    # NEW: CelebA-HQ resized to 64x64
+    # -------------------------
+    if data_str == "celebahq64":
+        from transportmodules.transportsCeleb import TransportG, TransportT  # noqa: F401
+        data_dir = (Path.cwd().parent / "data" / "celeba_hq_256" / "images").resolve()
+        img_size = 64
+        xshape = (3, img_size, img_size)
+        transform = make_transform(img_size=img_size, is_gray=False, do_augment=augmentation)
+        dataset_nn = CustomCelebAHQ(data_dir, transform=transform)
+
+        # You can keep these, but typical to increase batch vs 256 case.
+        PARAM = Parameters(batch_size=100, sample_size=1000, plot_freq=100, zdim=1000, scale=0.3) # the original zdim=100 but I changed it (4/3/2026) to address reviewer's comment
+        return dataset_nn, PARAM, img_size, xshape
+
+
     print(f"Unknown dataset: {data_str}")
     sys.exit(1)
 
@@ -989,19 +903,28 @@ def get_transport_classes(data_str: str):
     data_str = data_str.lower()
     if data_str == "mnist":
         from transportmodules.transportsMNIST import TransportG, TransportT, NetSingle
-    if data_str == "cifar":
+    elif data_str == "cifar":
         from transportmodules.transportsCifar import TransportG, TransportT, NetSingle
-    if data_str == "celeb":
+    elif data_str == "celeb":
         from transportmodules.transportsCeleb import TransportG, TransportT, NetSingle
-    if data_str == "ffhq":
-        from transportmodules.transportsCeleb import TransportG, TransportT, NetSingle
-    if data_str == "celebahq":
+    elif data_str == "celeb2":
+        from transportmodules.transportsCeleb2 import TransportG, TransportT, NetSingle
+    elif data_str == "celeb3":
+        from transportmodules.transportsCeleb3 import TransportG, TransportT, NetSingle
+    elif data_str == "celeb4":
+        from transportmodules.transportsCeleb4 import TransportG, TransportT, NetSingle
+    elif data_str == "ffhq":
+        from transportmodules.transportsFFHQ import TransportG, TransportT, NetSingle
+    elif data_str == "ffhq2":
+        from transportmodules.transportsFFHQ import TransportG, TransportT, NetSingle
+    elif data_str == "celebahq":
         from transportmodules.transportsCelebHQ import TransportG, TransportT, NetSingle
+    elif data_str == "celebahq64":
+        from transportmodules.transportsCeleb import TransportG, TransportT, NetSingle
+    else:
+        raise ValueError(f"Unknown dataset for transports: {data_str}") #hello
 
     return TransportT, TransportG, NetSingle
-
-    raise ValueError(f"Unknown dataset for transports: {data_str}")
-
 
 
 @torch.inference_mode()
@@ -1012,13 +935,18 @@ def compute_scalar_scale_C_from_dataloader(
     max_samples = 5000,
     device = None,
     eps = 1e-12,
-) -> Tuple[float, dict]:
+) -> Tuple[float, torch.Tensor, dict]:
     """
     Compute C = sqrt(D / E||T(x) - E[T(x)]||^2) using streaming statistics.
 
     Efficient version:
       - encoder forward pass happens on `device` (typically GPU)
       - statistics are accumulated on CPU in float64
+      
+    Returns:
+        C (float): The computed scalar scale.
+        mean (torch.Tensor): The computed mean of T(x) across the dataset (shape D, float32).
+        stats (dict): Additional statistics from the calculation.
     """
     encoder_was_training = encoder.training
     encoder.eval()
@@ -1077,15 +1005,18 @@ def compute_scalar_scale_C_from_dataloader(
     D_eff = int(mean_cpu.numel())
     C = math.sqrt(float(D_eff) / max(float(r2), eps))
 
+    # Cast the mean back to standard float32 before returning
+    mean_out = mean_cpu.to(dtype=torch.float32).to(device)
+
     stats = {
         "num_samples_used": int(n),
         "D": D_eff,
         "E_norm2_centered": float(r2),
         "C": float(C),
+        "mean": mean_out,
     }
-    return float(C), stats
-
-
+    
+    return stats
 
 # ----------------------------
 # Repro / device helpers
@@ -1135,3 +1066,348 @@ def set_visible_gpus(gpu_list: str | None) -> None:
     """
     if gpu_list is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_list
+
+
+# ----------------------------
+# 8x8 corner interpolation plot
+# ----------------------------
+@torch.inference_mode()
+def save_corner_interpolation_8x8(
+    *,
+    x_corners: torch.Tensor,   # (4, C, H, W) in [0,1] (or whatever your dataset gives)
+    T_scale_fn,                # callable: x -> latent (B,zdim)
+    S: torch.nn.Module,        # decoder: latent -> image
+    R: torch.nn.Module,        # velocity field
+    out_path: Path,
+    device: torch.device,
+    Nt_inv: int = 50,          # steps for inverse flow
+    Nt_fwd: int = 50,          # steps for forward flow
+    padding: int = 2,
+) -> None:
+    """
+    Build an 8x8 image grid where corners are the given images x1..x4, and all other
+    cells are generated by:
+      x_i -> T(x_i) -> inverse-flow via R to z_i
+      z-grid via bilinear interpolation of z1..z4
+      z(u,v) -> forward-flow via R to x(1) -> decode via S
+    """
+    assert x_corners.ndim == 4 and x_corners.size(0) == 4, "x_corners must be (4,C,H,W)"
+
+    # Make sure everything is on device
+    x_c = x_corners.to(device)
+
+    # Encode corners
+    Tx = T_scale_fn(x_c)  # (4,zdim)
+
+    # Inverse flow to get z1..z4
+    R_was_training = R.training
+    R.eval()
+
+    z_corners = pushforward_inv(R, Tx, Nt=Nt_inv)  # (4,zdim)
+    z1, z2, z3, z4 = z_corners[0], z_corners[1], z_corners[2], z_corners[3]
+
+    # Build 8x8 latent grid by bilinear interpolation in z-space.
+    # Convention:
+    #   (row=0,col=0) is z1  (top-left)
+    #   (row=0,col=7) is z2  (top-right)
+    #   (row=7,col=0) is z3  (bottom-left)
+    #   (row=7,col=7) is z4  (bottom-right)
+    n = 6
+    us = torch.linspace(0.0, 1.0, n, device=device, dtype=z1.dtype)  # horizontal
+    vs = torch.linspace(0.0, 1.0, n, device=device, dtype=z1.dtype)  # vertical
+
+    z_grid_list = []
+    for r in range(n):
+        v = vs[r]
+        for c in range(n):
+            u = us[c]
+            z_uv = (1 - u) * (1 - v) * z1 + u * (1 - v) * z2 + (1 - u) * v * z3 + u * v * z4
+            z_grid_list.append(z_uv)
+    z_grid = torch.stack(z_grid_list, dim=0)  # (64, zdim)
+
+    # Push forward through R to get latent at t=1, then decode
+    x1_lat = pushforward(R, z_grid, Nt=Nt_fwd)  # (64,zdim)
+    imgs_gen = S(x1_lat)  # (64,C,H,W)
+
+    # Convert both generated images and corners to the SAME display space
+    imgs_disp = to_disp(imgs_gen)   # (64,C,H,W) in [0,1]
+    corners_disp = to_disp(x_c)     # (4,C,H,W) in [0,1]
+
+    # Now overwrite corners (in display space)
+    idx_tl = 0
+    idx_tr = n - 1
+    idx_bl = (n - 1) * n
+    idx_br = n * n - 1
+    imgs_disp[idx_tl] = corners_disp[0]
+    imgs_disp[idx_tr] = corners_disp[1]
+    imgs_disp[idx_bl] = corners_disp[2]
+    imgs_disp[idx_br] = corners_disp[3]
+
+    grid = make_grid(imgs_disp, nrow=n, padding=padding)
+    save_image(grid, out_path)
+
+    # restore modes (optional)
+    if R_was_training:
+        R.train()
+
+
+
+from torchvision.models import inception_v3, Inception_V3_Weights
+from pytorch_fid.inception import InceptionV3
+
+# ===============================
+# Standard FID Utilities
+# ===============================
+import os
+import urllib.request
+import pickle
+import torch
+import torch.nn as nn
+
+# ===============================
+# Standard FID Utilities
+# ===============================
+import torch
+import torch.nn as nn
+from pytorch_fid.inception import InceptionV3
+
+class InceptionFeatureExtractor(nn.Module):
+    def __init__(self, device, input_range="[-1, 1]"):
+        super().__init__()
+        print('Loading standard Inception-v3 model from pytorch-fid...')
+        
+        # 2048 is the standard feature dimension for FID
+        block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
+        
+        # This automatically downloads and loads the correct legacy weights!
+        self.model = InceptionV3([block_idx]).to(device)
+        self.model.eval()
+        self.device = device
+        
+        # Store the expected input range to apply consistent scaling
+        valid_ranges = ["[-1, 1]", "[0, 1]", "[0, 255]"]
+        if input_range not in valid_ranges:
+            raise ValueError(f"input_range must be one of {valid_ranges}")
+        self.input_range = input_range
+
+    @torch.no_grad()
+    def forward(self, x):
+        """
+        Expects x to be [B, C, H, W].
+        Deterministically maps known input ranges to [0, 1] for Inception.
+        """
+        
+        # 1. Deterministic Normalization to [0, 1]
+        if self.input_range == "[0, 255]":
+            x = x / 255.0
+        elif self.input_range == "[-1, 1]":
+            x = (x + 1.0) / 2.0
+            
+        # Final clamp to guarantee strict bounds (handles minor float imprecision)
+        x = x.clamp(0.0, 1.0)
+
+        # 2. Ensure 3 channels (Grayscale to RGB)
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+
+        # 3. Extract features
+        # pytorch-fid inherently handles the 299x299 resizing internally
+        # and applies the ImageNet mean/std normalization.
+        features = self.model(x)[0]
+        
+        # Flatten spatial dimensions: [B, 2048, 1, 1] -> [B, 2048]
+        features = features.squeeze(3).squeeze(2)
+        
+        return features
+
+
+def calculate_fid(real_embeddings, generated_embeddings):
+    real_embeddings      = real_embeddings.reshape((real_embeddings.shape[0],-1))
+    generated_embeddings = generated_embeddings.reshape((generated_embeddings.shape[0],-1))
+    mu1, sigma1 = torch.mean(real_embeddings, dim=0), torch.cov(real_embeddings.t())
+    mu2, sigma2 = torch.mean(generated_embeddings, dim=0), torch.cov(generated_embeddings.t())
+    # Calculate sum squared difference between means
+    ssdiff = torch.sum((mu1 - mu2)**2.0)
+    # Calculate square root of the product between covariances
+    covmean = torch.sqrt(torch.mul(sigma1, sigma2))
+    # Convert to real part if complex
+    if covmean.is_complex():
+        covmean = covmean.real
+    # Calculate FID score
+    fid = ssdiff + torch.trace(sigma1 + sigma2 - 2.0 * covmean)
+    return fid.item()  # Convert to scalar value
+
+
+
+import torch
+import numpy as np
+import scipy.linalg
+
+def compute_frechet_stats(features: torch.Tensor):
+    """
+    Computes mu and sigma using PyTorch batched matrix operations.
+    Uses mean-centering to completely avoid floating-point cancellation errors.
+    """
+    if torch.isnan(features).any() or torch.isinf(features).any():
+        raise ValueError("Features contain NaNs or Infs! Check your pipeline.")
+        
+    # FLATTEN spatial dimensions if they exist
+    features = features.reshape(features.shape[0], -1)
+        
+    N = features.shape[0]
+    if N <= 1:
+        raise ValueError(f"Batch size must be > 1 to compute covariance. Got {N}")
+
+    # Force float64 for deep numerical stability
+    features = features.to(torch.float64)
+    
+    # 1. Calculate the mean
+    mu = features.mean(dim=0)
+    
+    # 2. Mean-center the features FIRST
+    centered_features = features - mu
+    
+    # 3. Compute covariance on the centered features
+    sigma = (centered_features.T @ centered_features) / (N - 1)
+
+    return mu.cpu().numpy(), sigma.cpu().numpy()
+
+def calculate_fid_from_inception_stats(mu, sigma, mu_ref, sigma_ref):
+    """
+    Computes the Fréchet Distance from precalculated mu and sigma.
+    Includes the robust SciPy numerical stability checks from the original code.
+    """
+    m = np.square(mu - mu_ref).sum()
+    cov_prod = np.dot(sigma, sigma_ref)
+    s, _ = scipy.linalg.sqrtm(cov_prod, disp=False)
+
+    # --- Standard Numerical Stability Checks ---
+    if not np.isfinite(s).all():
+        print("FID calculation produced singular product; adding 1e-6 to the diagonal.")
+        offset = np.eye(sigma.shape[0]) * 1e-6
+        s, _ = scipy.linalg.sqrtm(np.dot(sigma + offset, sigma_ref + offset), disp=False)
+
+    if np.iscomplexobj(s):
+        if not np.allclose(np.diagonal(s).imag, 0, atol=1e-3):
+            max_imag = np.max(np.abs(s.imag))
+            raise ValueError(f"Imaginary component {max_imag} is too high.")
+        s = s.real
+
+    fid = m + np.trace(sigma + sigma_ref - s * 2.0)
+    return float(np.real(fid))
+
+
+# ===============================
+# Inception FID: Gen & Recon
+# ===============================
+@torch.no_grad()
+def compute_fid_inception_gen_and_recon(
+    R, S_net, T_net, z_val, real_loader,
+    N_real: int,
+    Nt_push: int, 
+    gen_chunk: int = 256,
+    return_preview: int = 25,
+    device=None,
+):
+    """
+    Computes standard FID (using Inception features) for both:
+      1) Generated images: S_net(pushforward(R, z))
+      2) Reconstructed images: S_net(T_net(x))
+    """
+    R.eval()
+    S_net.eval()
+
+    # Load inception model dynamically and move to device
+    inception = InceptionFeatureExtractor(device)
+
+    # 1) Process Generated Images in Chunks
+    N_gen = z_val.size(0)
+    gen_feats_list = []
+    gen_feats_pixel_list = []
+    gen_vis = None
+
+    for i0 in range(0, N_gen, gen_chunk):
+        i1 = min(i0 + gen_chunk, N_gen)
+        z_chunk = z_val[i0:i1].to(device, non_blocking=True)
+
+        # Generate: decode(pushforward(z))
+        Rz  = pushforward(R, z_chunk, Nt=Nt_push)
+        SRz = S_net(Rz)
+
+        if gen_vis is None:
+            gen_vis = SRz[:min(return_preview, SRz.size(0))].detach().cpu()
+
+        if torch.isnan(Rz).any().item():
+            continue
+
+        gen_feats_list.append(inception(SRz))
+        gen_feats_pixel_list.append(extract_features(SRz))
+
+    gen_features = torch.cat(gen_feats_list, dim=0)
+    gen_pixel_features = torch.cat(gen_feats_pixel_list, dim=0)
+
+    # 2) Collect exactly N_real real images
+    imgs_list, n_collected = [], 0
+    for batch in real_loader:
+        imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
+        take = min(imgs.size(0), N_real - n_collected)
+        if take > 0:
+            imgs_list.append(imgs[:take].contiguous())
+            n_collected += take
+        if n_collected >= N_real:
+            break
+            
+    if n_collected < N_real:
+        raise ValueError(f"real_loader yielded only {n_collected} images, need {N_real}")
+
+    x_all = torch.cat(imgs_list, dim=0)
+
+    # 3) Process Real and Reconstructed in Chunks
+    real_feats_list = []
+    recon_feats_list = []
+    real_feats_pixel_list = []
+    recon_vis = None
+
+    for i0 in range(0, N_real, gen_chunk):
+        i1 = min(i0 + gen_chunk, N_real)
+        x_chunk = x_all[i0:i1].to(device, non_blocking=True)
+
+        real_feats_list.append(inception(x_chunk))
+        real_feats_pixel_list.append(extract_features(x_chunk))
+
+        # Reconstruct: decode(encode(x))
+        z_recon = T_net(x_chunk)
+        x_recon = S_net(z_recon)
+
+        if recon_vis is None:
+            recon_vis = x_recon[:min(return_preview, x_recon.size(0))].detach().cpu()
+
+        recon_feats_list.append(inception(x_recon))
+
+    real_features = torch.cat(real_feats_list, dim=0)
+    real_pixel_features = torch.cat(real_feats_pixel_list, dim=0)
+    recon_features = torch.cat(recon_feats_list, dim=0)
+
+    # 4) Compute Stats and FIDs using the new logic
+    # Calculate stats for the required feature tensors
+    mu_real, sigma_real = compute_frechet_stats(real_features)
+    mu_gen, sigma_gen   = compute_frechet_stats(gen_features)
+    mu_recon, sigma_recon = compute_frechet_stats(recon_features)
+    
+    mu_real_pix, sigma_real_pix = compute_frechet_stats(real_pixel_features)
+    mu_gen_pix, sigma_gen_pix   = compute_frechet_stats(gen_pixel_features)
+
+    # Calculate final FIDs
+    fid_gen   = calculate_fid_from_inception_stats(mu_real, sigma_real, mu_gen, sigma_gen)
+    fid_recon = calculate_fid_from_inception_stats(mu_recon, sigma_recon, mu_gen, sigma_gen)
+    fid_pixel = calculate_fid_from_inception_stats(mu_real_pix, sigma_real_pix, mu_gen_pix, sigma_gen_pix)
+
+    fid_tmp   = calculate_fid_from_inception_stats(mu_real, sigma_real, mu_recon, sigma_recon)
+    print(f"sanity: {fid_tmp}")
+
+    
+    # Free up VRAM from Inception model
+    del inception
+    torch.cuda.empty_cache()
+
+    return float(fid_gen), float(fid_recon), float(fid_pixel), gen_vis
