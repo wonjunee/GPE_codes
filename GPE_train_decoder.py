@@ -1,30 +1,7 @@
 #!/usr/bin/env python3
 """
-Train a GPE decoder S after a pretrained encoder T has been trained.
-
-Workflow:
-  1) Load dataset and build a training dataloader (optionally augmented).
-  2) Load pretrained encoder weights T.pth.
-  3) Compute a scalar scale C and define T_scale(x) = C * T(x).
-  4) Train decoder S to minimize reconstruction MSE:
-        loss = mean ||x - S(T_scale(x))||^2
-  5) Every `--eval_every` iterations:
-        - compute validation reconstruction loss on a fixed batch x_val
-        - save the loss curve to .npz
-        - save a 4x4 reconstruction comparison figure (input vs reconstruction)
-        - (optionally) save a checkpoint
-
-Assumptions:
-  - TransportT / TransportG and dataset wrappers exist in transportmodules.* (via utilfunctions).
-  - compute_reconstruction_loss_chunked(x_val, T_scale, S, chunk_size=...) exists in utilfunctions.py.
-  - helper utilities exist in utilfunctions.py:
-        set_visible_gpus, seed_everything, get_device, build_dataset_and_params,
-        get_transport_classes, safe_torch_load, maybe_wrap_dataparallel,
-        compute_scalar_scale_C_from_dataloader
-
-Important:
-  - If you enable augmentation for training, the fixed validation batch is still collected
-    from a non-augmented dataset to keep validation stable.
+GPE decoder Training Script.
+Trains a decoder S after a pretrained encoder T has been trained.
 """
 
 from __future__ import annotations
@@ -36,34 +13,30 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
-from torchvision.utils import make_grid
+from torchvision.utils import save_image
 import matplotlib.pyplot as plt
 
 from utilfunctions import *
 
 
 # ----------------------------
-# Small helpers
+# System & IO Helpers
 # ----------------------------
 @torch.inference_mode()
 def collect_fixed_validation_batch(
-    dataloader: DataLoader,
-    device: torch.device,
-    n_samples: int,
-    non_blocking: bool,
+    dataloader: DataLoader, device: torch.device, n_samples: int, non_blocking: bool
 ) -> torch.Tensor:
     chunks = []
     count = 0
     for imgs, _ in dataloader:
-        need = n_samples - count
-        take = min(need, imgs.size(0))
+        take = min(n_samples - count, imgs.size(0))
         chunks.append(imgs[:take].contiguous())
         count += take
         if count >= n_samples:
             break
-    x_val = torch.cat(chunks, dim=0)
-    return x_val.to(device, non_blocking=non_blocking).detach()
+    return torch.cat(chunks, dim=0).to(device, non_blocking=non_blocking).detach()
 
 
 def save_loss_curve_npz(save_data_dir: Path, xs: np.ndarray, loss_arr: np.ndarray) -> None:
@@ -71,13 +44,23 @@ def save_loss_curve_npz(save_data_dir: Path, xs: np.ndarray, loss_arr: np.ndarra
     np.savez(save_data_dir / "recons_loss_arr.npz", xs=xs, recons_loss_arr=loss_arr)
 
 
+def plot_reconstruction_loss(xs: np.ndarray, loss_arr: np.ndarray, save_path: Path) -> None:
+    """Generates and saves the reconstruction loss plot."""
+    plt.figure(figsize=(8, 5))
+    plt.plot(xs, loss_arr, linestyle='-', color='b', label='Reconstruction Loss')
+    plt.xlabel('Iterations')
+    plt.ylabel('MSE Loss')
+    plt.title('Reconstruction Loss vs Iteration')
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    plt.yscale('log') 
+    plt.legend()
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
 def _to_vis_01(u: torch.Tensor) -> torch.Tensor:
-    """
-    For visualization only:
-      - if looks like [-1,1], map to [0,1]
-      - clamp to [0,1]
-    """
-    u = u.detach().float().cpu()
+    """Clamps and normalizes a tensor for saving to an image."""
+    u = u.detach().float()
     umin, umax = float(u.min()), float(u.max())
     if umin >= -1.1 and umax <= 1.1:
         u = (u + 1.0) / 2.0
@@ -86,99 +69,119 @@ def _to_vis_01(u: torch.Tensor) -> torch.Tensor:
 
 @torch.inference_mode()
 def save_reconstruction_grid_4x4(
-    *,
-    x: torch.Tensor,            # (B,C,H,W)
-    T_scale,
-    S: torch.nn.Module,         # pass S.module if DataParallel
+    x: torch.Tensor,
+    T: nn.Module,
+    S: nn.Module,
+    mean_t: torch.Tensor,
+    C_t: torch.Tensor,
     save_path: Path,
     nrow: int = 4,
     max_items: int = 16,
 ) -> None:
-    """
-    Saves a 4x4 reconstruction comparison image.
-    Layout: top = input, bottom = reconstruction.
-    """
+    """Saves a comparison grid to disk purely via PyTorch (No matplotlib memory leaks)."""
     was_training = S.training
     S.eval()
 
-    x = x[:max_items].detach()
-    Tx = T_scale(x)
-    x_hat = S(Tx)
+    x_sub = x[:max_items]
+    z = (T(x_sub) - mean_t) * C_t
+    x_hat = S(z)
 
-    x_vis = _to_vis_01(x)
-    xhat_vis = _to_vis_01(x_hat)
-
-    grid_in = make_grid(x_vis, nrow=nrow, padding=2)
-    grid_out = make_grid(xhat_vis, nrow=nrow, padding=2)
-    comp = torch.cat([grid_in, grid_out], dim=1)  # stack vertically (CHW)
+    comp = torch.cat([_to_vis_01(x_sub), _to_vis_01(x_hat)], dim=0)
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(8, 8))
-    plt.imshow(comp.permute(1, 2, 0).numpy())
-    plt.axis("off")
-    plt.title("Top: input   |   Bottom: reconstruction")
-    plt.savefig(save_path, dpi=200, bbox_inches="tight")
-    plt.close()
+    save_image(comp, save_path, nrow=nrow, padding=2)
 
     if was_training:
         S.train()
 
 
+@torch.inference_mode()
+def plot_and_free_latent_scatter(
+    dataloader: DataLoader, T: nn.Module, mean_t: torch.Tensor, C_t: torch.Tensor,
+    device: torch.device, zdim: int, non_blocking: bool, save_path: Path, n_scatter: int = 5000
+) -> None:
+    """Isolates scatter plotting to safely clear CPU/GPU memory upon return."""
+    z_data = torch.empty(n_scatter, zdim, device="cpu")
+    filled = 0
+    for imgs, _ in dataloader:
+        x = imgs.to(device, non_blocking=non_blocking)
+        z = (T(x) - mean_t) * C_t
+        b = min(z.shape[0], n_scatter - filled)
+        z_data[filled : filled + b].copy_(z[:b].cpu())
+        filled += b
+        if filled >= n_scatter:
+            break
+
+    if filled < n_scatter:
+        raise RuntimeError(f"Only filled {filled} samples, need {n_scatter}")
+
+    z_gauss = torch.randn(n_scatter, zdim)
+    
+    plt.figure(figsize=(6, 6))
+    plt.scatter(z_gauss[:, 0], z_gauss[:, 1], s=5, alpha=0.4, label="Gaussian")
+    plt.scatter(z_data[:, 0], z_data[:, 1], s=5, alpha=0.4, label="C · (T(x) - mean)")
+    plt.axis("equal")
+    plt.legend()
+    plt.title(f"Latent scatter (zdim={zdim})")
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+# ----------------------------
+# Unified Pipeline Wrapper
+# ----------------------------
+class CombinedModelPipeline(nn.Module):
+    """
+    Fuses Encoder, Scaling, and Decoder into one module.
+    This prevents DataParallel from gathering and re-scattering tensors mid-loop.
+    """
+    def __init__(self, encoder: nn.Module, decoder: nn.Module, mean_t: torch.Tensor, C_t: torch.Tensor):
+        super().__init__()
+        self.T = encoder
+        self.S = decoder
+        # Registering states as buffers handles multi-GPU device migration automatically
+        self.register_buffer("mean_t", mean_t)
+        self.register_buffer("C_t", C_t)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            z = (self.T(x) - self.mean_t) * self.C_t
+        return self.S(z)
+
+    def TST_loss(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            z = (self.T(x) - self.mean_t) * self.C_t
+        Sz = self.S(z)
+        di = Sz - x
+        TSz = (self.T(Sz) - self.mean_t) * self.C_t
+        return (z - TSz).pow(2).mean() + di.pow(2).mean() + di.abs().mean()
+
+# ----------------------------
+# Main Configuration
+# ----------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-
-    # training
     p.add_argument("--num_iter", type=int, default=1_000_000)
     p.add_argument("--batch_size", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--beta1", type=float, default=0.5)
     p.add_argument("--beta2", type=float, default=0.999)
-
-    # dataset / device
     p.add_argument("--data", type=str, default="celeb")
-    p.add_argument("--cuda", action="store_true", help="Require CUDA; error if unavailable.")
+    p.add_argument("--cuda", action="store_true", help="Require CUDA")
     p.add_argument("--gpus", type=str, default=None)
-
-    # augmentation
-    p.add_argument(
-        "--augmentation",
-        action="store_true",
-        help="If set, apply dataset augmentations in build_dataset_and_params(..., augmentation=True) for training.",
-    )
-
-    # validation / logging
+    p.add_argument("--augmentation", action="store_true")
     p.add_argument("--val_size", type=int, default=256)
     p.add_argument("--eval_every", type=int, default=1000)
-    p.add_argument("--print_every", type=int, default=100)
-
-    # I/O tags
+    p.add_argument("--print_every", type=int, default=200)
     p.add_argument("--saving", type=str, default="0")
     p.add_argument("--fig", type=str, default="0")
-
-    # model parallel
-    p.add_argument("--T_parallel", action="store_true", help="Wrap encoder T in torch.nn.DataParallel (CUDA only).")
-    p.add_argument("--S_parallel", action="store_true", help="Wrap decoder S in torch.nn.DataParallel (CUDA only).")
-
-    # checkpointing
+    p.add_argument("--T_parallel", action="store_true")
+    p.add_argument("--S_parallel", action="store_true")
     p.add_argument("--encoder_ckpt", type=str, default="T.pth")
     p.add_argument("--save_decoder_every", type=int, default=1000)
-
-    # NEW: optional load decoder checkpoint from save_data_dir
-    p.add_argument(
-        "--decoder_ckpt",
-        type=str,
-        default=None,
-        help="If provided, load decoder S weights from save_data_dir / decoder_ckpt before training (e.g. S.pth).",
-    )
-    p.add_argument(
-        "--decoder_strict",
-        action="store_true",
-        help="If set, load decoder checkpoint with strict=True (default is strict=False).",
-    )
-
-    # optional: stop after scatter plot
+    p.add_argument("--decoder_ckpt", type=str, default=None)
+    p.add_argument("--decoder_strict", action="store_true")
     p.add_argument("--scatter_only", action="store_true")
-
     return p.parse_args()
 
 
@@ -192,272 +195,138 @@ def main() -> None:
 
     device = get_device(force_cuda_flag=args.cuda)
     cuda = device.type == "cuda"
-    num_gpus = torch.cuda.device_count() if cuda else 0
-    print(f"Device: {device} | GPUs visible: {num_gpus}" if cuda else f"Device: {device}")
+    print(f"Device: {device} | GPUs visible: {torch.cuda.device_count() if cuda else 0}")
 
-    # Output dirs
-    data_str = args.data.lower()
-    save_fig_dir = Path(f"fig_{data_str}_{args.saving}_{args.fig}")
-    save_data_dir = Path(f"data_{data_str}_{args.saving}")
+    # Paths
+    save_fig_dir = Path(f"fig_{args.data.lower()}_{args.saving}_{args.fig}")
+    save_data_dir = Path(f"data_{args.data.lower()}_{args.saving}")
     save_fig_dir.mkdir(parents=True, exist_ok=True)
     save_data_dir.mkdir(parents=True, exist_ok=True)
-    print("saving figures in", save_fig_dir)
-    print("saving data in", save_data_dir)
-
-    # Dataset + config
-    # Training dataset may be augmented; validation dataset must NOT be augmented.
-    dataset_train, PARAM, img_size, xshape = build_dataset_and_params(
-        args.data, augmentation=bool(args.augmentation)
-    )
-    dataset_val, _, _, _ = build_dataset_and_params(args.data, augmentation=False)
-
-    zdim = PARAM.zdim
-    print(f"zdim: {zdim} | data: {args.data} | do_augment: {bool(args.augmentation)} | saving tag: {args.saving}")
 
     # DataLoaders
-    num_workers = (num_gpus * 8) if cuda else 0
-    pin_memory = bool(cuda)
-    non_blocking = bool(cuda)
+    dataset_train, PARAM, img_size, xshape = build_dataset_and_params(args.data, augmentation=bool(args.augmentation))
+    dataset_val, _, _, _ = build_dataset_and_params(args.data, augmentation=False)
+    zdim, batch_size = PARAM.zdim, PARAM.batch_size
 
-    dataloader = DataLoader(
-        dataset_train,
-        batch_size=args.batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        shuffle=True,
-        drop_last=True,
-    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": (torch.cuda.device_count() * 4) if cuda else 0,
+        "pin_memory": cuda,
+    }
+    dataloader = DataLoader(dataset_train, shuffle=True, drop_last=True, **loader_kwargs)
+    val_loader = DataLoader(dataset_val, shuffle=False, drop_last=False, **loader_kwargs)
 
-    val_loader = DataLoader(
-        dataset_val,
-        batch_size=args.batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        shuffle=False,
-        drop_last=False,
-    )
+    x_val = collect_fixed_validation_batch(val_loader, device, args.val_size, cuda)
 
-    # Fixed validation batch (non-augmented)
-    x_val = collect_fixed_validation_batch(
-        dataloader=val_loader,
-        device=device,
-        n_samples=args.val_size,
-        non_blocking=non_blocking,
-    )
-    print("Validation batch shape:", tuple(x_val.shape))
-
-    # Models
+    # Setup Encoder T
     TransportT, TransportG, _ = get_transport_classes(args.data)
-
-    # ---- Load encoder T ----
-    T = TransportT(input_shape=xshape, zdim=zdim)
-    T_ckpt_path = save_data_dir / args.encoder_ckpt
-    T_ckpt = safe_torch_load(T_ckpt_path, device=device)
-
-    if isinstance(T_ckpt, dict) and "state_dict" in T_ckpt:
-        T.load_state_dict(T_ckpt["state_dict"])
-    else:
-        T.load_state_dict(T_ckpt)
-
-    T = maybe_wrap_dataparallel(T, force=args.T_parallel, device=device)
-    print(f"Loaded encoder T from {T_ckpt_path}")
-
-    # Freeze encoder
+    T = TransportT(input_shape=xshape, zdim=zdim).to(device)
+    T_ckpt = safe_torch_load(save_data_dir / args.encoder_ckpt, device=device)
+    T.load_state_dict(T_ckpt["state_dict"] if isinstance(T_ckpt, dict) and "state_dict" in T_ckpt else T_ckpt)
+    
+    # We leave T unwrapped here; it gets parallelized inside the unified pipeline wrapper later
     T.eval()
-    for p_ in T.parameters():
-        p_.requires_grad_(False)
+    for p in T.parameters():
+        p.requires_grad_(False)
 
-    # ---- Compute scalar scale C and save ----
-    C, C_stats = compute_scalar_scale_C_from_dataloader(
-        dataloader=dataloader,
-        encoder=T,
-        max_samples=5_000,
-        device=device,
+    # Compute & Lock Scale Stats onto GPU
+    stats = compute_scalar_scale_C_from_dataloader(dataloader, T, max_samples=5000, device=device)
+    torch.save({"C": stats["C"], "mean": stats["mean"], "dataset": args.data}, save_data_dir / "scale.pth")
+    
+    mean_t = torch.tensor(stats["mean"], device=device, dtype=torch.float32)
+    C_t = torch.tensor(stats["C"], device=device, dtype=torch.float32)
+
+    # Scatter Plot
+    plot_and_free_latent_scatter(
+        dataloader, T, mean_t, C_t, device, zdim, cuda, 
+        save_path=save_fig_dir / "latent_scatter_gaussian_vs_data.png"
     )
-    print("Computed C =", C)
-
-    scale_payload = {"C": float(C), "stats": C_stats, "dataset": args.data}
-    scale_path = save_data_dir / "scale.pth"
-    torch.save(scale_payload, scale_path)
-    print("Saved scale to", scale_path)
-
-    # @torch.inference_mode()
-    def T_scale(x: torch.Tensor) -> torch.Tensor:
-        return T(x) * scale_payload["C"]
-
-    # ---------------------------------------------------------
-    # Scatter plot: Gaussian vs C*T(x)
-    # ---------------------------------------------------------
-    torch.manual_seed(0)
-    n_scatter = 5000
-
-    z_data = torch.empty(n_scatter, zdim, device="cpu")
-    filled = 0
-    for imgs, _ in dataloader:
-        x = imgs.to(device, non_blocking=non_blocking)
-        with torch.no_grad():
-            z = T(x) * C
-
-        b = min(z.shape[0], n_scatter - filled)
-        z_data[filled:filled + b].copy_(z[:b].detach().cpu())
-        filled += b
-        if filled >= n_scatter:
-            break
-
-    if filled < n_scatter:
-        raise RuntimeError(f"Only filled {filled} samples, need {n_scatter}")
-
-    z_gauss = torch.randn(n_scatter, zdim)
-    z_data_2d = z_data[:, :2]
-    z_gauss_2d = z_gauss[:, :2]
-
-    plt.figure(figsize=(6, 6))
-    plt.scatter(z_gauss_2d[:, 0], z_gauss_2d[:, 1], s=5, alpha=0.4, label="Gaussian")
-    plt.scatter(z_data_2d[:, 0], z_data_2d[:, 1], s=5, alpha=0.4, label="C · T(x)")
-    plt.axis("equal")
-    plt.legend()
-    plt.title(f"Latent scatter (zdim={zdim})")
-
-    scatter_path = save_fig_dir / "latent_scatter_gaussian_vs_data.png"
-    plt.savefig(scatter_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print("Saved latent scatter plot to", scatter_path)
-
     if args.scatter_only:
-        print("scatter_only set, exiting now.")
         sys.exit(0)
 
-    # ---------------------------------------------------------
-    # Decoder S
-    # ---------------------------------------------------------
+    # Setup Decoder S
     S = TransportG(output_shape=xshape, zdim=zdim).to(device)
 
-    if args.S_parallel:
-        if device.type != "cuda":
-            raise RuntimeError("--S_parallel requires CUDA.")
-        S = torch.nn.DataParallel(S).to(device)
-
-    # ---- Optional: load decoder checkpoint from save_data_dir ----
-    if args.decoder_ckpt is not None:
+    if args.decoder_ckpt:
         S_ckpt_path = save_data_dir / args.decoder_ckpt
-        if not S_ckpt_path.exists():
-            raise FileNotFoundError(f"Decoder checkpoint not found: {S_ckpt_path}")
-
         S_ckpt = safe_torch_load(S_ckpt_path, device=device)
+        sd = S_ckpt["state_dict"] if isinstance(S_ckpt, dict) and "state_dict" in S_ckpt else S_ckpt
+        S.load_state_dict(sd, strict=args.decoder_strict)
 
-        # Load into the underlying module (handles DataParallel cleanly)
-        S_target = S.module if isinstance(S, torch.nn.DataParallel) else S
+    print(f"Params in T: {sum(p.numel() for p in T.parameters()):,}")
+    print(f"Params in S: {sum(p.numel() for p in S.parameters()):,}")
 
-        if isinstance(S_ckpt, dict) and "state_dict" in S_ckpt:
-            sd = S_ckpt["state_dict"]
-        else:
-            sd = S_ckpt
+    # Build Unified Pipeline Wrapper
+    model_pipeline = CombinedModelPipeline(T, S, mean_t, C_t).to(device)
+    
+    # Crucial: Target ONLY the S parameters inside the pipeline wrapper
+    optS = torch.optim.Adam(model_pipeline.S.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
+    
+    # Wrap the entire unified execution graph into DataParallel
+    if args.S_parallel and cuda:
+        model_pipeline = nn.DataParallel(model_pipeline)
 
-        missing, unexpected = S_target.load_state_dict(sd, strict=bool(args.decoder_strict))
-        print(f"Loaded decoder S from {S_ckpt_path}")
-        if (not args.decoder_strict) and (len(missing) > 0 or len(unexpected) > 0):
-            print(f"[Decoder load] missing keys: {len(missing)} | unexpected keys: {len(unexpected)}")
-
-    optS = torch.optim.Adam(S.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
-
-    # Tracking
-    recons_loss_arr: list[float] = []
-
-    # Timing
-    t0 = time.time()
-    t_last_eval = t0
-    t_last_print = t0
+    # Training Loop
+    recons_loss_arr = []
+    t0 = t_last_eval = t_last_print = time.time()
+    total_iters = 0
 
     print("Starting training...")
-    S.train()
+    model_pipeline.train()
 
-    total_iterations = 0
-    while total_iterations < args.num_iter:
+    # Create pointer references to original modules for plotting functions compatibility
+    pure_T = model_pipeline.module.T if isinstance(model_pipeline, nn.DataParallel) else model_pipeline.T
+    pure_S = model_pipeline.module.S if isinstance(model_pipeline, nn.DataParallel) else model_pipeline.S
+
+    while total_iters < args.num_iter:
         for imgs, _ in dataloader:
-            if total_iterations >= args.num_iter:
+            if total_iters >= args.num_iter:
                 break
 
-            x = imgs.to(device, non_blocking=non_blocking)
-
-            # Forward through frozen encoder
-            Tx = T_scale(x).detach()
-
-            # Train decoder
+            x = imgs.to(device, non_blocking=cuda)
+            
             optS.zero_grad(set_to_none=True)
-            STx = S(Tx)
-            loss = (x - STx).pow(2).mean()
+            # The forward pass processes T, Scaling, and S fully local to each GPU
+            loss = model_pipeline.TST_loss(x)
             loss.backward()
             optS.step()
 
-            total_iterations += 1
+            total_iters += 1
+            t_now = time.time()
 
-            # Print training loss
-            if args.print_every > 0 and (total_iterations % args.print_every == 0):
-                t_now = time.time()
-                dt = t_now - t_last_print
-                ms_per_iter = (dt / max(args.print_every, 1)) * 1000.0
-                elapsed_min = (t_now - t0) / 60.0
-                print(
-                    f"[Train] iter {total_iterations}/{args.num_iter} | "
-                    f"loss {loss.item():.3e} | "
-                    f"{ms_per_iter:.2f} ms/iter | "
-                    f"elapsed {elapsed_min:.1f} min"
-                )
+            # Logging
+            if args.print_every > 0 and total_iters % args.print_every == 0:
+                ms_per_iter = ((t_now - t_last_print) / args.print_every) * 1000.0
+                print(f"[Train] iter {total_iters}/{args.num_iter} | loss {loss.item():.3e} | {ms_per_iter:.2f} ms/iter")
                 t_last_print = t_now
 
-            # Eval / plot
-            if args.eval_every > 0 and (total_iterations % args.eval_every == 0):
-                t_now = time.time()
-                dt_window = t_now - t_last_eval
-                avg_ms_window = (dt_window / max(args.eval_every, 1)) * 1000.0
-                avg_ms_total = ((t_now - t0) / max(total_iterations, 1)) * 1000.0
-                print(
-                    f"[Timing] iter {total_iterations} | "
-                    f"last {args.eval_every} iters: {avg_ms_window:.2f} ms/iter | "
-                    f"overall: {avg_ms_total:.2f} ms/iter"
-                )
-
-                # Underlying module for utils/plots
-                S_base = S.module if isinstance(S, torch.nn.DataParallel) else S
-
-                # Validation loss on fixed batch
-                S.eval()
+            # Validation & Checkpointing
+            if args.eval_every > 0 and total_iters % args.eval_every == 0:
+                model_pipeline.eval()
+                model_pipeline.S.training = False
                 with torch.inference_mode():
-                    val_loss = compute_reconstruction_loss_chunked(
-                        x_val, T_scale, S_base, chunk_size=100
-                    )
+                    val_loss = (x_val - model_pipeline(x_val)).pow(2).mean().item()
+                
+                recons_loss_arr.append(val_loss)
+                print(f"[Val] iter {total_iters}: recon loss = {val_loss:.3e}")
 
-                recons_loss_arr.append(float(val_loss))
-                print(f"[Val] iter {total_iterations}: recon loss = {val_loss:.3e}")
-
-                xs = np.arange(len(recons_loss_arr)) * int(args.eval_every)
-                save_loss_curve_npz(save_data_dir, xs=xs, loss_arr=np.array(recons_loss_arr))
-                print("[Save] loss curve ->", save_data_dir / "recons_loss_arr.npz")
-
-                # 4x4 reconstruction grid
-                grid_path = save_fig_dir / f"recons_grid_iter_{total_iterations:07d}.png"
+                xs = np.arange(1, len(recons_loss_arr) + 1) * args.eval_every
+                save_loss_curve_npz(save_data_dir, xs, np.array(recons_loss_arr))
+                plot_reconstruction_loss(xs, np.array(recons_loss_arr), save_fig_dir / "0_recons_loss.png")
+                
                 save_reconstruction_grid_4x4(
-                    x=x,
-                    T_scale=T_scale,
-                    S=S_base,
-                    save_path=grid_path,
-                    nrow=4,
-                    max_items=16,
+                    x_val, pure_T, pure_S, mean_t, C_t, 
+                    save_path=save_fig_dir / f"recons_grid_iter_{total_iters//50_000*50_000:07d}.png"
                 )
-                print("[Fig] saved reconstruction grid ->", grid_path)
 
-                # Save decoder checkpoint
-                if args.save_decoder_every > 0 and (total_iterations % args.save_decoder_every == 0):
-                    ckpt_path = save_data_dir / "S.pth"
-                    to_save = S.module.state_dict() if isinstance(S, torch.nn.DataParallel) else S.state_dict()
-                    torch.save(to_save, ckpt_path)
-                    print("[Save] decoder checkpoint ->", ckpt_path)
+                if args.save_decoder_every > 0 and total_iters % args.save_decoder_every == 0:
+                    torch.save(pure_S.state_dict(), save_data_dir / "S.pth")
 
-                S.train()
-                t_last_eval = t_now
+                model_pipeline.train()
+                model_pipeline.S.training = True
+                t_last_eval = t_last_print = time.time() 
 
     print("Training complete.")
-
 
 if __name__ == "__main__":
     main()
